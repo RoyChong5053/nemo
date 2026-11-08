@@ -40,6 +40,8 @@
 #include <libnemo-private/nemo-file.h>
 #include <libnemo-private/nemo-file-utilities.h>
 #include <libnemo-private/nemo-global-preferences.h>
+#include <libnemo-private/nemo-remote-policy.h>
+#include "rclone/nemo-rclone-thumbs.h"
 
 #define DEBUG_FLAG NEMO_DEBUG_WINDOW
 #include <libnemo-private/nemo-debug.h>
@@ -722,10 +724,24 @@ nemo_window_slot_set_show_thumbnails (NemoWindowSlot *slot,
                                       gboolean show_thumbnails)
 {
   NemoDirectory *directory;
+  char *path;
 
   directory = nemo_directory_get (slot->location);
   nemo_directory_set_show_thumbnails(directory, show_thumbnails);
   nemo_directory_unref (directory);
+
+  /* rclone fork: the built-in per-directory toggle is persisted via GVFS
+     metadata:: xattr, which rclone FUSE mounts do not support.  Mirror the
+     opt-in into our own JSON whitelist so it sticks across sessions. */
+  path = g_file_get_path (slot->location);
+  if (path != NULL && nemo_remote_policy_path_is_slow (path)) {
+      if (show_thumbnails) {
+          nemo_rclone_thumbs_add (path);
+      } else {
+          nemo_rclone_thumbs_remove (path);
+      }
+  }
+  g_free (path);
 }
 
 void

@@ -12,6 +12,8 @@
 
 #include "nemo-rclone-window.h"
 #include "nemo-rclone-service.h"
+#include "nemo-window.h"
+#include "nemo-window-slot.h"
 
 #include <gio/gio.h>
 #include <glib/gi18n.h>
@@ -20,6 +22,7 @@
 
 typedef struct {
 	GtkWidget *window;
+	GtkWindow *parent;
 
 	GtkWidget *remote_a;
 	GtkWidget *path_a;
@@ -47,6 +50,8 @@ typedef struct {
 	gboolean running;
 	gboolean read_done;
 	gboolean wait_done;
+
+	guint status_timer;
 } RcloneWindow;
 
 static RcloneWindow *rclone_window = NULL;
@@ -747,6 +752,12 @@ reload_favorites (RcloneWindow *self)
 	for (i = 0; i < favorites->len; i++) {
 		NemoRcloneFavorite *favorite = g_ptr_array_index (favorites, i);
 
+		const char *status;
+
+		status = nemo_rclone_service_favorite_is_mounted (self->service,
+		                                                  favorite->id) ?
+		                                _("█ Mounted") : _("◌ Offline");
+
 		gtk_list_store_append (self->favorites_store, &iter);
 		gtk_list_store_set (self->favorites_store, &iter,
 		                    0, favorite->label,
@@ -754,6 +765,7 @@ reload_favorites (RcloneWindow *self)
 		                    2, favorite->path,
 		                    3, favorite->mountpoint,
 		                    4, favorite->id,
+		                    5, status,
 		                    -1);
 	}
 }
@@ -861,6 +873,455 @@ on_favorite_remove (GtkButton *button,
 		g_free (id);
 		reload_favorites (self);
 	}
+}
+
+
+/* --------------------------- rclone:// handling --------------------------- */
+
+static char *
+normalize_path (const char *path)
+{
+	char *normalized;
+	gsize len;
+
+	if (path == NULL || path[0] == '\0') {
+		return g_strdup ("/");
+	}
+
+	normalized = path[0] == '/' ? g_strdup (path) : g_strconcat ("/", path, NULL);
+
+	len = strlen (normalized);
+	while (len > 1 && normalized[len - 1] == '/') {
+		normalized[--len] = '\0';
+	}
+
+	return normalized;
+}
+
+static gboolean
+path_is_under (const char *path,
+               const char *prefix)
+{
+	gsize len;
+
+	if (prefix == NULL || prefix[0] == '\0' || g_strcmp0 (prefix, "/") == 0) {
+		return TRUE;
+	}
+
+	len = strlen (prefix);
+	return g_str_has_prefix (path, prefix) &&
+	       (path[len] == '\0' || path[len] == '/');
+}
+
+static void
+show_mount_error (GtkWindow *parent,
+                  const char *mountpoint,
+                  const char *message)
+{
+	char *tail = mountpoint != NULL ?
+		nemo_rclone_service_get_mount_log_tail (mountpoint, 3000) : NULL;
+	char *detail = g_strdup_printf ("%s%s%s",
+	                                message != NULL ? message : _("unknown error"),
+	                                tail != NULL && tail[0] != '\0' ? "\n\n" : "",
+	                                tail != NULL ? tail : "");
+	GtkWidget *dialog;
+
+	dialog = gtk_message_dialog_new (parent,
+	                                 GTK_DIALOG_DESTROY_WITH_PARENT,
+	                                 GTK_MESSAGE_ERROR,
+	                                 GTK_BUTTONS_CLOSE,
+	                                 "%s", _("Rclone mount failed"));
+	gtk_message_dialog_format_secondary_text (GTK_MESSAGE_DIALOG (dialog),
+	                                          "%s", detail);
+	gtk_dialog_run (GTK_DIALOG (dialog));
+	gtk_widget_destroy (dialog);
+
+	g_free (detail);
+	g_free (tail);
+}
+
+static void
+open_local_path (GtkWindow *parent,
+                 const char *local)
+{
+	GFile *location;
+	NemoWindowSlot *slot;
+
+	if (!NEMO_IS_WINDOW (parent) || local == NULL) {
+		return;
+	}
+
+	location = g_file_new_for_path (local);
+	slot = nemo_window_get_active_slot (NEMO_WINDOW (parent));
+
+	if (slot != NULL) {
+		nemo_window_slot_open_location (slot, location, 0);
+	}
+
+	g_object_unref (location);
+}
+
+static void
+open_local_mount (GtkWindow *parent,
+                  const char *mountpoint,
+                  const char *subpath)
+{
+	char *local;
+
+	if (mountpoint == NULL) {
+		return;
+	}
+
+	if (subpath != NULL && subpath[0] != '\0') {
+		local = g_build_filename (mountpoint, subpath, NULL);
+	} else {
+		local = g_strdup (mountpoint);
+	}
+
+	open_local_path (parent, local);
+	g_free (local);
+}
+
+typedef struct {
+	GtkWindow *parent;        /* weak pointer */
+	GtkLabel *status_label;   /* owned by parent window */
+	char *mountpoint;
+	char *subpath;            /* NULL: open the mount root */
+	gboolean open_location;
+	guint ticks;
+} RcloneMountWait;
+
+static void
+mount_wait_free (RcloneMountWait *wait)
+{
+	if (wait->parent != NULL) {
+		g_object_remove_weak_pointer (G_OBJECT (wait->parent),
+		                              (gpointer *) &wait->parent);
+	}
+	g_free (wait->mountpoint);
+	g_free (wait->subpath);
+	g_free (wait);
+}
+
+static gboolean
+mount_wait_tick (gpointer user_data)
+{
+	RcloneMountWait *wait = user_data;
+
+	if (wait->parent == NULL) {
+		mount_wait_free (wait);
+		return G_SOURCE_REMOVE;
+	}
+
+	if (nemo_rclone_service_is_mount_active (wait->mountpoint)) {
+		if (wait->status_label != NULL) {
+			char *msg = g_strdup_printf (_("Mounted at %s"), wait->mountpoint);
+			gtk_label_set_text (wait->status_label, msg);
+			g_free (msg);
+		}
+		if (wait->open_location) {
+			open_local_mount (wait->parent, wait->mountpoint, wait->subpath);
+		}
+		mount_wait_free (wait);
+		return G_SOURCE_REMOVE;
+	}
+
+	if (++wait->ticks >= 100) {
+		if (wait->status_label != NULL) {
+			gtk_label_set_text (wait->status_label, _("Mount did not become ready."));
+		}
+		show_mount_error (wait->parent, wait->mountpoint,
+		                  _("rclone did not finish mounting within 10 seconds."));
+		mount_wait_free (wait);
+		return G_SOURCE_REMOVE;
+	}
+
+	return G_SOURCE_CONTINUE;
+}
+
+static void
+mount_wait_start (GtkWindow *parent,
+                  GtkLabel *status_label,
+                  const char *mountpoint,
+                  const char *subpath,
+                  gboolean open_location)
+{
+	RcloneMountWait *wait = g_new0 (RcloneMountWait, 1);
+
+	wait->parent = parent;
+	g_object_add_weak_pointer (G_OBJECT (parent), (gpointer *) &wait->parent);
+	wait->status_label = status_label;
+	wait->mountpoint = g_strdup (mountpoint);
+	wait->subpath = subpath != NULL && subpath[0] != '\0' ? g_strdup (subpath) : NULL;
+	wait->open_location = open_location;
+
+	if (nemo_rclone_service_is_mount_active (mountpoint)) {
+		mount_wait_tick (wait);
+		return;
+	}
+
+	g_timeout_add (100, mount_wait_tick, wait);
+}
+
+/* Find the favorite whose remote path is the longest prefix of path.  The
+   remainder is returned in relative_out (caller frees). */
+static NemoRcloneFavorite *
+find_favorite_for (NemoRcloneService *service,
+                   const char *remote,
+                   const char *path,
+                   char **relative_out)
+{
+	GPtrArray *favorites = nemo_rclone_service_get_favorites (service);
+	NemoRcloneFavorite *best = NULL;
+	char *wanted = normalize_path (path);
+	gsize best_len = 0;
+	guint i;
+
+	for (i = 0; i < favorites->len; i++) {
+		NemoRcloneFavorite *favorite = g_ptr_array_index (favorites, i);
+		char *favorite_path;
+		gsize len;
+
+		if (g_strcmp0 (favorite->remote, remote) != 0) {
+			continue;
+		}
+
+		favorite_path = normalize_path (favorite->path);
+		if (!path_is_under (wanted, favorite_path)) {
+			g_free (favorite_path);
+			continue;
+		}
+
+		len = g_strcmp0 (favorite_path, "/") == 0 ? 0 : strlen (favorite_path);
+		if (best == NULL || len > best_len) {
+			best = favorite;
+			best_len = len;
+		}
+
+		g_free (favorite_path);
+	}
+
+	if (best != NULL && relative_out != NULL) {
+		const char *relative = wanted + best_len;
+		while (relative[0] == '/') {
+			relative++;
+		}
+		*relative_out = g_strdup (relative);
+	}
+
+	g_free (wanted);
+	return best;
+}
+
+void
+nemo_rclone_open_uri (GtkWindow *parent,
+                      const char *uri)
+{
+	NemoRcloneService *service;
+	NemoRcloneFavorite *favorite;
+	char *rest;
+	char *trimmed;
+	char *remote = NULL;
+	char *path = NULL;
+	char *relative = NULL;
+	char *mountpoint;
+
+	if (uri == NULL || !g_str_has_prefix (uri, "rclone:")) {
+		return;
+	}
+
+	rest = g_strdup (uri + strlen ("rclone:"));
+	while (rest[0] == '/') {
+		memmove (rest, rest + 1, strlen (rest));
+	}
+
+	trimmed = g_strdup (rest);
+	while (trimmed[0] != '\0' && trimmed[strlen (trimmed) - 1] == '/') {
+		trimmed[strlen (trimmed) - 1] = '\0';
+	}
+	g_free (rest);
+
+	if (trimmed[0] == '\0' || g_strcmp0 (trimmed, "transfer") == 0 ||
+	    g_strcmp0 (trimmed, "transfers") == 0) {
+		g_free (trimmed);
+		nemo_rclone_window_show (parent);
+		return;
+	}
+
+	{
+		char *slash = strchr (trimmed, '/');
+		char *escaped_remote;
+		char *escaped_path;
+
+		if (slash == NULL) {
+			escaped_remote = g_strdup (trimmed);
+			escaped_path = g_strdup ("/");
+		} else {
+			escaped_remote = g_strndup (trimmed, slash - trimmed);
+			escaped_path = g_strdup (slash);
+		}
+
+		remote = g_uri_unescape_string (escaped_remote, NULL);
+		path = g_uri_unescape_string (escaped_path, NULL);
+
+		if (remote == NULL) {
+			remote = g_strdup (escaped_remote);
+		}
+		if (path == NULL) {
+			path = g_strdup (escaped_path);
+		}
+
+		g_free (escaped_remote);
+		g_free (escaped_path);
+	}
+	g_free (trimmed);
+
+	if (remote[0] == '\0') {
+		g_free (remote);
+		g_free (path);
+		nemo_rclone_window_show (parent);
+		return;
+	}
+
+	service = nemo_rclone_service_get_default ();
+
+	/* Already available through any active mount (including one started
+	   outside Nemo, or a broader mount that contains this path). */
+	{
+		char *local = nemo_rclone_service_remote_to_local (service, remote, path, NULL);
+
+		if (local != NULL) {
+			open_local_path (parent, local);
+			g_free (local);
+			g_free (remote);
+			g_free (path);
+			return;
+		}
+	}
+
+	favorite = find_favorite_for (service, remote, path, &relative);
+
+	if (favorite == NULL) {
+		/* No saved favorite: open the transfer window with this source
+		   pre-filled instead of failing to open the location. */
+		nemo_rclone_window_show_with_source (parent, remote, path);
+		g_free (remote);
+		g_free (path);
+		return;
+	}
+
+	{
+		GError *error = NULL;
+
+		mountpoint = nemo_rclone_service_mount_favorite (service, favorite->id, &error);
+		if (mountpoint == NULL) {
+			show_mount_error (parent, favorite->mountpoint,
+			                  error != NULL ? error->message : _("unknown error"));
+			g_clear_error (&error);
+		} else {
+			mount_wait_start (parent, NULL, mountpoint, relative, TRUE);
+			g_free (mountpoint);
+		}
+	}
+
+	g_free (relative);
+	g_free (remote);
+	g_free (path);
+}
+
+static void
+on_favorite_mount (GtkButton *button,
+                   gpointer user_data)
+{
+	RcloneWindow *self = user_data;
+	char *id = NULL, *mountpoint = NULL;
+	GError *error = NULL;
+
+	(void) button;
+
+	if (!get_selected_favorite (self, NULL, NULL, &id)) {
+		return;
+	}
+
+	if (nemo_rclone_service_favorite_is_mounted (self->service, id)) {
+		gtk_label_set_text (GTK_LABEL (self->status_label), _("Already mounted."));
+		g_free (id);
+		return;
+	}
+
+	mountpoint = nemo_rclone_service_mount_favorite (self->service, id, &error);
+	if (mountpoint == NULL) {
+		char *msg = g_strdup_printf (_("Mount failed: %s"),
+		                             error != NULL ? error->message : _("unknown error"));
+		gtk_label_set_text (GTK_LABEL (self->status_label), msg);
+		g_free (msg);
+		if (error != NULL) {
+			g_error_free (error);
+		}
+	} else {
+		char *msg = g_strdup_printf (_("Mounting at %s…"), mountpoint);
+		gtk_label_set_text (GTK_LABEL (self->status_label), msg);
+		g_free (msg);
+		mount_wait_start (GTK_WINDOW (self->window), GTK_LABEL (self->status_label),
+		                  mountpoint, NULL, FALSE);
+		g_free (mountpoint);
+		reload_favorites (self);
+	}
+
+	g_free (id);
+}
+
+static void
+on_favorite_unmount (GtkButton *button,
+                     gpointer user_data)
+{
+	RcloneWindow *self = user_data;
+	char *id = NULL;
+	GError *error = NULL;
+
+	(void) button;
+
+	if (!get_selected_favorite (self, NULL, NULL, &id)) {
+		return;
+	}
+
+	if (!nemo_rclone_service_unmount_favorite (self->service, id, &error)) {
+		char *msg = g_strdup_printf (_("Unmount failed: %s"),
+		                             error != NULL ? error->message : _("unknown error"));
+		gtk_label_set_text (GTK_LABEL (self->status_label), msg);
+		g_free (msg);
+		if (error != NULL) {
+			g_error_free (error);
+		}
+	} else {
+		gtk_label_set_text (GTK_LABEL (self->status_label), _("Unmounted."));
+		reload_favorites (self);
+	}
+
+	g_free (id);
+}
+
+static void
+on_favorite_open (GtkButton *button,
+                  gpointer user_data)
+{
+	RcloneWindow *self = user_data;
+	char *remote = NULL, *path = NULL, *id = NULL;
+	char *uri;
+
+	(void) button;
+
+	if (!get_selected_favorite (self, &remote, &path, &id)) {
+		return;
+	}
+
+	uri = nemo_rclone_service_format_uri (remote, path);
+	nemo_rclone_open_uri (GTK_WINDOW (self->window), uri);
+
+	g_free (uri);
+	g_free (remote);
+	g_free (path);
+	g_free (id);
 }
 
 static void
@@ -1078,13 +1539,17 @@ build_favorites_tab (RcloneWindow *self)
 	GtkWidget *remove_button;
 	GtkWidget *use_a_button;
 	GtkWidget *use_b_button;
+	GtkWidget *mount_button;
+	GtkWidget *unmount_button;
+	GtkWidget *open_button;
 	GtkCellRenderer *renderer;
 	GtkTreeViewColumn *column;
 
 	vbox = gtk_box_new (GTK_ORIENTATION_VERTICAL, 6);
 	gtk_container_set_border_width (GTK_CONTAINER (vbox), 10);
 
-	self->favorites_store = gtk_list_store_new (5,
+	self->favorites_store = gtk_list_store_new (6,
+	                                            G_TYPE_STRING,
 	                                            G_TYPE_STRING,
 	                                            G_TYPE_STRING,
 	                                            G_TYPE_STRING,
@@ -1112,6 +1577,11 @@ build_favorites_tab (RcloneWindow *self)
 	gtk_tree_view_column_set_expand (column, TRUE);
 	gtk_tree_view_append_column (GTK_TREE_VIEW (self->favorites_view), column);
 
+	renderer = gtk_cell_renderer_text_new ();
+	column = gtk_tree_view_column_new_with_attributes (_("Status"), renderer,
+	                                                   "text", 5, NULL);
+	gtk_tree_view_append_column (GTK_TREE_VIEW (self->favorites_view), column);
+
 	g_signal_connect (self->favorites_view, "row-activated",
 	                  G_CALLBACK (on_favorite_row_activated), self);
 
@@ -1136,10 +1606,20 @@ build_favorites_tab (RcloneWindow *self)
 	use_b_button = gtk_button_new_with_label (_("Use as B"));
 	gtk_container_add (GTK_CONTAINER (buttons), use_b_button);
 
+	mount_button = gtk_button_new_with_label (_("Mount"));
+	gtk_container_add (GTK_CONTAINER (buttons), mount_button);
+	unmount_button = gtk_button_new_with_label (_("Unmount"));
+	gtk_container_add (GTK_CONTAINER (buttons), unmount_button);
+	open_button = gtk_button_new_with_label (_("Open"));
+	gtk_container_add (GTK_CONTAINER (buttons), open_button);
+
 	g_signal_connect (add_button, "clicked", G_CALLBACK (on_favorite_add), self);
 	g_signal_connect (remove_button, "clicked", G_CALLBACK (on_favorite_remove), self);
 	g_signal_connect (use_a_button, "clicked", G_CALLBACK (on_favorite_use_a), self);
 	g_signal_connect (use_b_button, "clicked", G_CALLBACK (on_favorite_use_b), self);
+	g_signal_connect (mount_button, "clicked", G_CALLBACK (on_favorite_mount), self);
+	g_signal_connect (unmount_button, "clicked", G_CALLBACK (on_favorite_unmount), self);
+	g_signal_connect (open_button, "clicked", G_CALLBACK (on_favorite_open), self);
 
 	return vbox;
 }
@@ -1152,11 +1632,28 @@ on_window_destroy (GtkWidget *widget,
 
 	(void) widget;
 
+	if (self->status_timer != 0) {
+		g_source_remove (self->status_timer);
+		self->status_timer = 0;
+	}
+
 	if (rclone_window == self) {
 		rclone_window = NULL;
 	}
 
 	g_free (self);
+}
+
+static gboolean
+favorites_status_tick (gpointer user_data)
+{
+	RcloneWindow *self = user_data;
+
+	if (self->window != NULL && gtk_widget_get_visible (self->window)) {
+		reload_favorites (self);
+	}
+
+	return G_SOURCE_CONTINUE;
 }
 
 static RcloneWindow *
@@ -1171,6 +1668,7 @@ rclone_window_new (GtkWindow *parent)
 
 	self = g_new0 (RcloneWindow, 1);
 	self->service = nemo_rclone_service_get_default ();
+	self->parent = parent;
 
 	self->window = gtk_window_new (GTK_WINDOW_TOPLEVEL);
 	gtk_window_set_title (GTK_WINDOW (self->window), _("Rclone"));
@@ -1205,6 +1703,7 @@ rclone_window_new (GtkWindow *parent)
 	}
 
 	reload_favorites (self);
+	self->status_timer = g_timeout_add_seconds (2, favorites_status_tick, self);
 
 	g_signal_connect (self->window, "delete-event",
 	                  G_CALLBACK (on_delete_event), self);

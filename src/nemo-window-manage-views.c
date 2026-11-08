@@ -40,6 +40,7 @@
 #include "nemo-x-content-bar.h"
 #include "nemo-interesting-folder-bar.h"
 #include "nemo-thumbnail-problem-bar.h"
+#include "rclone/nemo-rclone-window.h"
 #include <eel/eel-accessibility.h>
 #include <eel/eel-debug.h>
 #include <eel/eel-glib-extensions.h>
@@ -458,6 +459,25 @@ nemo_window_slot_open_location_full (NemoWindowSlot *slot,
 	new_uri = g_file_get_uri (location);
 
 	DEBUG ("Opening location, old: %s, new: %s", old_uri, new_uri);
+
+	/* "rclone://" is a Nemo-level pseudo scheme, not a GIO backend.  Handle
+	   it here so CLI arguments, the location bar, session restore and
+	   programmatic opens all work without G_IO_ERROR_NOT_SUPPORTED. */
+	{
+		char *scheme = g_file_get_uri_scheme (location);
+
+		if (g_strcmp0 (scheme, "rclone") == 0) {
+			nemo_rclone_open_uri (GTK_WINDOW (window), new_uri);
+			g_free (scheme);
+			g_free (old_uri);
+			g_free (new_uri);
+			if (callback != NULL) {
+				callback (window, NULL, user_data);
+			}
+			return;
+		}
+		g_free (scheme);
+	}
 
 	g_free (old_uri);
 	g_free (new_uri);

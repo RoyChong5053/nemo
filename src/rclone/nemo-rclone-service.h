@@ -57,6 +57,52 @@ char               *nemo_rclone_service_remote_to_local   (NemoRcloneService *se
                                                            const char        *path,
                                                            char             **mountpoint);
 
+/* Mount management (on-demand FUSE mounts under a predictable base path). */
+
+/* Slugify a label into a filesystem-safe token suitable for a mountpoint. */
+char               *nemo_rclone_service_slugify           (const char        *label);
+
+/* Resolve the mountpoint for a favorite: keep an existing one, otherwise
+   derive a deterministic path under the mount base (env NEMO_RCLONE_MOUNT_BASE,
+   default ~/.local/share/nemo-rclone/mounts).  Caller frees the result. */
+char               *nemo_rclone_service_resolve_mountpoint (NemoRcloneService *self,
+                                                           const char        *remote,
+                                                           const char        *path,
+                                                           const char        *label);
+
+/* Format a rclone location URI understood by Nemo ("rclone://remote/path").
+   Caller frees the result. */
+char               *nemo_rclone_service_format_uri        (const char        *remote,
+                                                           const char        *path);
+
+/* Path of the log file used by the mount for mountpoint.  Caller frees. */
+char               *nemo_rclone_service_get_mount_log_path (const char        *mountpoint);
+
+/* Return the tail of a mount log (or NULL when there is no log).  Caller
+   frees the result. */
+char               *nemo_rclone_service_get_mount_log_tail (const char        *mountpoint,
+                                                            gsize              max_bytes);
+
+/* Whether an rclone FUSE mount is currently active at mountpoint. */
+gboolean            nemo_rclone_service_is_mount_active   (const char        *mountpoint);
+
+/* Whether the favorite identified by id is currently mounted. */
+gboolean            nemo_rclone_service_favorite_is_mounted (NemoRcloneService *self,
+                                                             const char        *id);
+
+/* Ensure the favorite identified by id is mounted.  On success returns a newly
+   allocated string with the mountpoint (caller frees), and persists it.  On
+   failure returns NULL and sets error. */
+char               *nemo_rclone_service_mount_favorite    (NemoRcloneService *self,
+                                                           const char        *id,
+                                                           GError           **error);
+
+/* Unmount the favorite identified by id (if mounted) and clear its persisted
+   mountpoint.  Returns TRUE on success (or if nothing to do). */
+gboolean            nemo_rclone_service_unmount_favorite  (NemoRcloneService *self,
+                                                           const char        *id,
+                                                           GError           **error);
+
 char               *nemo_rclone_service_format_path       (const char        *remote,
                                                            const char        *path);
 

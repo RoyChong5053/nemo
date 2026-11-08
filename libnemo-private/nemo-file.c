@@ -45,6 +45,7 @@
 #include "nemo-search-engine.h"
 #include "nemo-search-directory-file.h"
 #include "nemo-remote-policy.h"
+#include "src/rclone/nemo-rclone-thumbs.h"
 #include "nemo-thumbnails.h"
 #include "nemo-trash-monitor.h"
 #include "nemo-vfs-file.h"
@@ -4494,6 +4495,16 @@ nemo_file_should_show_thumbnail (NemoFile *file)
 
     if (!NEMO_IS_FILE (file)) {
         return FALSE;
+    }
+
+    /* rclone fork: a remote mount the user explicitly opted into keeps
+       generating thumbnails even under the default local-only policy.
+       nemo_rclone_thumbs_is_enabled() only matches remote mount paths, so
+       this is a cheap string-prefix match and never affects local files.
+       The opt-in is persisted in our own JSON because GVFS metadata::
+       xattr is not supported on rclone FUSE mounts. */
+    if (nemo_rclone_thumbs_is_enabled (nemo_file_get_path (file))) {
+        return TRUE;
     }
 
 	use_preview = nemo_file_get_filesystem_use_preview (file);

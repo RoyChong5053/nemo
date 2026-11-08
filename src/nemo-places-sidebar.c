@@ -1252,11 +1252,8 @@ update_places (NemoPlacesSidebar *sidebar)
             if (local != NULL) {
                 uri = g_filename_to_uri (local, NULL, NULL);
             } else {
-                const char *path = favorite->path != NULL ? favorite->path : "";
-                uri = g_strdup_printf ("rclone://%s%s%s",
-                                       favorite->remote,
-                                       path[0] == '/' ? "" : "/",
-                                       path);
+                uri = nemo_rclone_service_format_uri (favorite->remote,
+                                                      favorite->path);
             }
 
             tooltip = nemo_rclone_service_format_path (favorite->remote,
@@ -2860,36 +2857,10 @@ open_selected_bookmark (NemoPlacesSidebar *sidebar,
 	if (uri != NULL) {
 		DEBUG ("Activating bookmark %s", uri);
 
-		if (g_str_has_prefix (uri, "rclone://")) {
-			const char *rest = uri + strlen ("rclone://");
-
-			if (g_strcmp0 (rest, "transfer") == 0) {
-				nemo_rclone_window_show (GTK_WINDOW (sidebar->window));
-			} else {
-				const char *slash = strchr (rest, '/');
-				char *remote;
-				char *path;
-				char *full_path;
-
-				if (slash == NULL) {
-					remote = g_strdup (rest);
-					path = g_strdup ("");
-				} else {
-					remote = g_strndup (rest, slash - rest);
-					path = g_strdup (slash);
-				}
-
-				full_path = g_strdup_printf ("/%s",
-				                             path[0] == '/' ? path + 1 : path);
-
-				nemo_rclone_window_show_with_source (GTK_WINDOW (sidebar->window),
-				                                     remote, full_path);
-
-				g_free (remote);
-				g_free (path);
-				g_free (full_path);
-			}
-
+		if (g_str_has_prefix (uri, "rclone:")) {
+			/* Let the shared handler mount favorites on demand and
+			   fall back to the transfer window for unknown paths. */
+			nemo_rclone_open_uri (GTK_WINDOW (sidebar->window), uri);
 			g_free (uri);
 			return;
 		}

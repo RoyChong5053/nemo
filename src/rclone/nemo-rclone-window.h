@@ -19,6 +19,12 @@ void nemo_rclone_window_show (GtkWindow *parent);
 void nemo_rclone_window_show_with_source (GtkWindow *parent,
                                           const char *remote,
                                           const char *path);
+
+/* Open a "rclone://transfer" or "rclone://remote/path" location.  Paths that
+   belong to a favorite are mounted on demand and opened locally; unknown
+   paths open the transfer window with the source pre-filled. */
+void nemo_rclone_open_uri (GtkWindow *parent,
+                           const char *uri);
 void nemo_rclone_window_show_with_selection (GtkWindow *parent,
                                              const char *remote,
                                              const char *path);

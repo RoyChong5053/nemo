@@ -39,8 +39,21 @@ be rebased onto new releases.
   ```
 
 - Sidebar section **Rclone** with a **Transfers** entry and one row per
-  favorite.  A favorite opens the mount path when the remote is mounted, or
-  pre-fills the transfer window when it is not.
+  favorite.  Activating a favorite mounts it on demand (`rclone mount`) and
+  opens the local mountpoint.  If the path does not belong to a favorite, the
+  transfer window opens with that remote/path pre-filled instead.
+- The `rclone://` scheme is handled by Nemo itself (not a GIO/GVFS backend),
+  so it works from the sidebar, the location bar, `nemo rclone://...` and
+  session restore without `G_IO_ERROR_NOT_SUPPORTED`:
+  - `rclone://transfer` opens the transfer window.
+  - `rclone://remote/path` mounts the matching favorite and opens it.
+  - unknown `remote/path` opens the transfer window with the source filled in.
+- On-demand mounts are created under `~/.local/share/nemo-rclone/mounts/` by
+  default, or `/mnt/nemo-rclone/` when `/mnt` is writable by the user.  Set
+  `NEMO_RCLONE_MOUNT_BASE` to override the location.  Each mount writes its
+  log to `~/.cache/nemo-rclone/<mountpoint>.log`; failures show the log tail.
+- Favorites tab has **Mount**, **Unmount** and **Open** buttons plus a live
+  mounted/offline status column.
 - Right-click menu **Rclone**:
   - Open Rclone Transfer…
   - Mark as Rclone Favorite…
@@ -111,6 +124,9 @@ cheap change notification.
 
 ## Known limitations / next steps
 
+- On-demand mounts are plain detached `rclone mount` processes; there are no
+  systemd units yet, so they are not restarted after a crash and are not
+  unmounted automatically at logout.
 - Copy/paste inside Nemo into a writable rclone mount still goes through FUSE,
   so Nemo's progress dialog can hit 100% before rclone finishes uploading from
   the VFS cache.  For now, start transfers from the Rclone window
