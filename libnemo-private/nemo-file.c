@@ -44,6 +44,7 @@
 #include "nemo-search-directory.h"
 #include "nemo-search-engine.h"
 #include "nemo-search-directory-file.h"
+#include "nemo-remote-policy.h"
 #include "nemo-thumbnails.h"
 #include "nemo-trash-monitor.h"
 #include "nemo-vfs-file.h"
@@ -5457,6 +5458,12 @@ nemo_file_should_show_directory_item_count (NemoFile *file)
 
 	g_return_val_if_fail (NEMO_IS_FILE (file), FALSE);
 
+	/* Item counts only make sense for directories; this also avoids a mount
+	 * lookup for every regular file in the directory. */
+	if (!nemo_file_is_directory (file)) {
+		return FALSE;
+	}
+
 	if (file->details->mime_type &&
 	    strcmp (file->details->mime_type, "x-directory/smb-share") == 0) {
 		return FALSE;
@@ -5472,6 +5479,10 @@ nemo_file_should_show_directory_item_count (NemoFile *file)
 
 		/* Peek for the first time */
 		show_directory_item_count_changed_callback (NULL);
+	}
+
+	if (nemo_remote_policy_should_skip_item_count (file)) {
+		return FALSE;
 	}
 
 	return get_speed_tradeoff_preference_for_file (file, show_directory_item_count);

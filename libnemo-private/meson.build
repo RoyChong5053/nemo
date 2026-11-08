@@ -68,6 +68,7 @@ nemo_private_sources = [
   'nemo-progress-info.c',
   'nemo-query.c',
   'nemo-recent.c',
+  'nemo-remote-policy.c',
   'nemo-search-directory-file.c',
   'nemo-search-directory.c',
   'nemo-search-engine-advanced.c',

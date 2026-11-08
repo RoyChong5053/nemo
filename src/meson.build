@@ -59,6 +59,8 @@ nemoCommon_sources = [
   'nemo-progress-ui-handler.c',
   'nemo-properties-window.c',
   'nemo-query-editor.c',
+  'rclone/nemo-rclone-service.c',
+  'rclone/nemo-rclone-window.c',
   'nemo-template-config-widget.c',
   'nemo-self-check-functions.c',
   'nemo-statusbar.c',
@@ -125,7 +127,8 @@ nemo = executable('nemo',
   include_directories: [ rootInclude ],
   c_args: nemo_definitions,
   dependencies: nemo_deps,
-  install: true
+  install: true,
+  install_rpath: join_paths(get_option('prefix'), get_option('libdir'))
 )
 
 nemoDesktop = executable('nemo-desktop',
@@ -133,7 +136,8 @@ nemoDesktop = executable('nemo-desktop',
   include_directories: [ rootInclude],
   c_args: nemo_definitions,
   dependencies: nemo_deps,
-  install: true
+  install: true,
+  install_rpath: join_paths(get_option('prefix'), get_option('libdir'))
 )
 
 nemo_autorun_software = executable('nemo-autorun-software',

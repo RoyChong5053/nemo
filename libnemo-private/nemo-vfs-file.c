@@ -29,6 +29,7 @@
 #include "nemo-directory-notify.h"
 #include "nemo-directory-private.h"
 #include "nemo-file-private.h"
+#include "nemo-remote-policy.h"
 #include <glib/gi18n.h>
 
 G_DEFINE_TYPE (NemoVFSFile, nemo_vfs_file, NEMO_TYPE_FILE);
@@ -126,7 +127,7 @@ set_metadata_callback (GObject *source_object,
 
 	if (res) {
 		g_file_query_info_async (G_FILE (source_object),
-					 NEMO_FILE_DEFAULT_ATTRIBUTES,
+					 nemo_remote_policy_get_attributes (file),
 					 0,
 					 G_PRIORITY_DEFAULT,
 					 NULL,

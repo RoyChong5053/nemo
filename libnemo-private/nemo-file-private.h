@@ -35,6 +35,14 @@
 #define NEMO_FILE_DEFAULT_ATTRIBUTES				\
 	"standard::*,access::*,mountable::*,time::*,unix::*,owner::*,selinux::*,thumbnail::*,id::filesystem,trash::orig-path,trash::deletion-date,metadata::*,preview::icon"
 
+/* Lean attribute set for slow remote filesystems (rclone/sshfs/cifs/nfs).
+ * We deliberately avoid access::*, owner::*, selinux::*, metadata::* and
+ * trash::* because each of those can turn into an extra FUSE/xattr round
+ * trip per file.  The omitted values are fetched lazily when a view really
+ * needs them. */
+#define NEMO_FILE_REMOTE_ATTRIBUTES				\
+	"standard::name,standard::display-name,standard::type,standard::size,standard::icon,standard::content-type,standard::fast-content-type,standard::is-hidden,standard::is-backup,standard::is-symlink,standard::symlink-target,standard::target-uri,time::modified,time::modified-usec,time::changed,unix::mode,unix::uid,unix::gid,unix::inode,id::filesystem,thumbnail::path,preview::icon,metadata::*"
+
 /* These are in the typical sort order. Known things come first, then
  * things where we can't know, finally things where we don't yet know.
  */

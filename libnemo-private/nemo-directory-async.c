@@ -25,6 +25,7 @@
 #include <config.h>
 
 #include "nemo-directory-notify.h"
+#include "nemo-remote-policy.h"
 #include "nemo-directory-private.h"
 #include "nemo-file-attributes.h"
 #include "nemo-file-private.h"
@@ -54,6 +55,18 @@
 #endif
 
 #define DIRECTORY_LOAD_ITEMS_PER_CALLBACK 100
+
+/* Enumerating a slow remote directory with the full attribute set turns into
+ * one access()/getxattr() round trip per file.  Use the lean set there. */
+static const char *
+attributes_for_directory (NemoDirectory *directory)
+{
+	if (nemo_remote_policy_directory_is_slow (directory)) {
+		return NEMO_FILE_REMOTE_ATTRIBUTES;
+	}
+
+	return NEMO_FILE_DEFAULT_ATTRIBUTES;
+}
 
 /* Keep async. jobs down to this number for all directories. */
 #define MAX_ASYNC_JOBS 10
@@ -1514,7 +1527,7 @@ nemo_directory_get_info_for_new_files (NemoDirectory *directory,
 		state->count++;
 		
 		g_file_query_info_async (location,
-					 NEMO_FILE_DEFAULT_ATTRIBUTES,
+					 attributes_for_directory (directory),
 					 0,
 					 G_PRIORITY_DEFAULT,
 					 state->cancellable,
@@ -2115,7 +2128,7 @@ start_monitoring_file_list (NemoDirectory *directory)
 	directory->details->directory_load_in_progress = state;
 	
 	g_file_enumerate_children_async (directory->details->location,
-					 NEMO_FILE_DEFAULT_ATTRIBUTES,
+					 attributes_for_directory (directory),
 					 0, /* flags */
 					 G_PRIORITY_DEFAULT, /* prio */
 					 state->cancellable,
@@ -3275,7 +3288,7 @@ file_info_start (NemoDirectory *directory,
 	
 	location = nemo_file_get_location (file);
 	g_file_query_info_async (location,
-				 NEMO_FILE_DEFAULT_ATTRIBUTES,
+				 nemo_remote_policy_get_attributes (file),
 				 0,
 				 G_PRIORITY_DEFAULT,
 				 state->cancellable, query_info_callback, state);

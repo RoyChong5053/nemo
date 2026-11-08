@@ -64,6 +64,8 @@
 #include "nemo-properties-window.h"
 #include "nemo-window.h"
 #include "nemo-window-slot.h"
+#include "rclone/nemo-rclone-service.h"
+#include "rclone/nemo-rclone-window.h"
 
 #define DEBUG_FLAG NEMO_DEBUG_PLACES
 #include <libnemo-private/nemo-debug.h>
@@ -135,6 +137,7 @@ typedef struct {
 
     gboolean my_computer_expanded;
     gboolean bookmarks_expanded;
+    gboolean rclone_expanded;
     gboolean devices_expanded;
     gboolean network_expanded;
 
@@ -197,12 +200,14 @@ typedef enum {
 	PLACES_MOUNTED_VOLUME,
 	PLACES_BOOKMARK,
 	PLACES_HEADING,
+	PLACES_RCLONE,
 } PlaceType;
 
 typedef enum {
     SECTION_COMPUTER,
     SECTION_XDG_BOOKMARKS,
     SECTION_BOOKMARKS,
+	SECTION_RCLONE,
 	SECTION_DEVICES,
 	SECTION_NETWORK,
 } SectionType;
@@ -854,6 +859,11 @@ restore_expand_state_foreach (GtkTreeModel *model,
                 gtk_tree_view_expand_to_path (sidebar->tree_view, path);
             else
                 gtk_tree_view_collapse_row (sidebar->tree_view, path);
+        } else if (section_type == SECTION_RCLONE) {
+            if (sidebar->rclone_expanded)
+                gtk_tree_view_expand_to_path (sidebar->tree_view, path);
+            else
+                gtk_tree_view_collapse_row (sidebar->tree_view, path);
         } else if (section_type == SECTION_DEVICES) {
             if (sidebar->devices_expanded)
                 gtk_tree_view_expand_to_path (sidebar->tree_view, path);
@@ -886,6 +896,9 @@ static void expand_or_collapse_category (NemoPlacesSidebar *sidebar,
             break;
         case SECTION_BOOKMARKS:
             sidebar->bookmarks_expanded = expand;
+            break;
+        case SECTION_RCLONE:
+            sidebar->rclone_expanded = expand;
             break;
         case SECTION_DEVICES:
             sidebar->devices_expanded = expand;
@@ -1210,6 +1223,58 @@ update_places (NemoPlacesSidebar *sidebar)
         g_free (mount_uri);
         g_free (tooltip);
         ++bookmark_index;
+    }
+
+    /* Rclone section: one management entry plus the user's named paths. */
+    cat_iter = add_heading (sidebar, SECTION_RCLONE, _("Rclone"));
+    cat_iter = add_place (sidebar, PLACES_RCLONE,
+                          SECTION_RCLONE,
+                          _("Transfers"),
+                          "folder-remote",
+                          "rclone://transfer",
+                          NULL, NULL, NULL, 0,
+                          _("Open the Rclone transfer window"),
+                          cat_iter);
+    {
+        NemoRcloneService *service = nemo_rclone_service_get_default ();
+        GPtrArray *favorites = nemo_rclone_service_get_favorites (service);
+        guint favorite_index;
+
+        for (favorite_index = 0; favorite_index < favorites->len; favorite_index++) {
+            NemoRcloneFavorite *favorite = g_ptr_array_index (favorites, favorite_index);
+            char *local = nemo_rclone_service_remote_to_local (service,
+                                                               favorite->remote,
+                                                               favorite->path,
+                                                               NULL);
+            char *uri;
+            char *tooltip;
+
+            if (local != NULL) {
+                uri = g_filename_to_uri (local, NULL, NULL);
+            } else {
+                const char *path = favorite->path != NULL ? favorite->path : "";
+                uri = g_strdup_printf ("rclone://%s%s%s",
+                                       favorite->remote,
+                                       path[0] == '/' ? "" : "/",
+                                       path);
+            }
+
+            tooltip = nemo_rclone_service_format_path (favorite->remote,
+                                                       favorite->path);
+
+            cat_iter = add_place (sidebar, PLACES_RCLONE,
+                                  SECTION_RCLONE,
+                                  favorite->label,
+                                  "folder-remote",
+                                  uri,
+                                  NULL, NULL, NULL, favorite_index,
+                                  tooltip,
+                                  cat_iter);
+
+            g_free (local);
+            g_free (uri);
+            g_free (tooltip);
+        }
     }
 
     GList *place_infos = NULL;
@@ -1838,6 +1903,8 @@ cat_is_expanded (NemoPlacesSidebar *sidebar,
             return sidebar->my_computer_expanded;
         case SECTION_BOOKMARKS:
             return sidebar->bookmarks_expanded;
+        case SECTION_RCLONE:
+            return sidebar->rclone_expanded;
         case SECTION_DEVICES:
             return sidebar->devices_expanded;
         case SECTION_NETWORK:
@@ -2792,6 +2859,40 @@ open_selected_bookmark (NemoPlacesSidebar *sidebar,
 
 	if (uri != NULL) {
 		DEBUG ("Activating bookmark %s", uri);
+
+		if (g_str_has_prefix (uri, "rclone://")) {
+			const char *rest = uri + strlen ("rclone://");
+
+			if (g_strcmp0 (rest, "transfer") == 0) {
+				nemo_rclone_window_show (GTK_WINDOW (sidebar->window));
+			} else {
+				const char *slash = strchr (rest, '/');
+				char *remote;
+				char *path;
+				char *full_path;
+
+				if (slash == NULL) {
+					remote = g_strdup (rest);
+					path = g_strdup ("");
+				} else {
+					remote = g_strndup (rest, slash - rest);
+					path = g_strdup (slash);
+				}
+
+				full_path = g_strdup_printf ("/%s",
+				                             path[0] == '/' ? path + 1 : path);
+
+				nemo_rclone_window_show_with_source (GTK_WINDOW (sidebar->window),
+				                                     remote, full_path);
+
+				g_free (remote);
+				g_free (path);
+				g_free (full_path);
+			}
+
+			g_free (uri);
+			return;
+		}
 
 		location = g_file_new_for_uri (uri);
 		/* Navigate to the clicked location */
@@ -4284,6 +4385,8 @@ row_activated_cb (GtkTreeView       *tree_view,
             sidebar->my_computer_expanded = !sidebar->my_computer_expanded;
         } else if (section_type == SECTION_BOOKMARKS) {
             sidebar->bookmarks_expanded = !sidebar->bookmarks_expanded;
+        } else if (section_type == SECTION_RCLONE) {
+            sidebar->rclone_expanded = !sidebar->rclone_expanded;
         } else if (section_type == SECTION_DEVICES) {
             sidebar->devices_expanded = !sidebar->devices_expanded;
         } else if (section_type == SECTION_NETWORK) {
@@ -4524,6 +4627,7 @@ nemo_places_sidebar_init (NemoPlacesSidebar *sidebar)
                                                             NEMO_WINDOW_STATE_MY_COMPUTER_EXPANDED);
     sidebar->bookmarks_expanded = g_settings_get_boolean (nemo_window_state,
                                                              NEMO_WINDOW_STATE_BOOKMARKS_EXPANDED);
+    sidebar->rclone_expanded = TRUE;
     sidebar->devices_expanded = g_settings_get_boolean (nemo_window_state,
                                                         NEMO_WINDOW_STATE_DEVICES_EXPANDED);
     sidebar->network_expanded = g_settings_get_boolean (nemo_window_state,

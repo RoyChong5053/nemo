@@ -40,6 +40,8 @@
 #include "nemo-properties-window.h"
 #include "nemo-bookmark-list.h"
 #include "nemo-directory-private.h"
+#include "rclone/nemo-rclone-service.h"
+#include "rclone/nemo-rclone-window.h"
 
 #include <sys/stat.h>
 #include <fcntl.h>
@@ -6809,6 +6811,154 @@ update_templates_menu (NemoView *view)
 	g_free (templates_directory_uri);
 }
 
+static void
+rclone_menu_open_window_cb (GtkMenuItem *item,
+                            gpointer user_data)
+{
+	NemoView *view = user_data;
+
+	(void) item;
+
+	nemo_rclone_window_show (nemo_view_get_containing_window (view));
+}
+
+static void
+rclone_menu_mark_favorite_cb (GtkMenuItem *item,
+                              gpointer user_data)
+{
+	NemoView *view = user_data;
+	const char *local_path = g_object_get_data (G_OBJECT (item), "rclone-local");
+	const char *remote = g_object_get_data (G_OBJECT (item), "rclone-remote");
+	const char *remote_path = g_object_get_data (G_OBJECT (item), "rclone-rpath");
+	NemoRcloneService *service = nemo_rclone_service_get_default ();
+
+	nemo_rclone_service_prompt_add_favorite (service,
+	                                         nemo_view_get_containing_window (view),
+	                                         local_path, remote, remote_path);
+}
+
+static void
+rclone_menu_copy_path_cb (GtkMenuItem *item,
+                          gpointer user_data)
+{
+	const char *text = g_object_get_data (G_OBJECT (item), "rclone-formatted");
+	GtkClipboard *clipboard;
+
+	(void) user_data;
+
+	if (text == NULL) {
+		return;
+	}
+
+	clipboard = gtk_clipboard_get (GDK_SELECTION_CLIPBOARD);
+	gtk_clipboard_set_text (clipboard, text, -1);
+}
+
+static void
+rclone_menu_use_source_cb (GtkMenuItem *item,
+                           gpointer user_data)
+{
+	NemoView *view = user_data;
+	const char *remote = g_object_get_data (G_OBJECT (item), "rclone-remote");
+	const char *remote_path = g_object_get_data (G_OBJECT (item), "rclone-rpath");
+
+	nemo_rclone_window_show_with_source (nemo_view_get_containing_window (view),
+	                                     remote, remote_path);
+}
+
+static void
+append_rclone_menu (NemoView *view,
+                    GtkMenu *menu,
+                    gboolean background)
+{
+	NemoRcloneService *service;
+	GList *selection;
+	NemoFile *file = NULL;
+	char *local_path = NULL;
+	char *remote = NULL;
+	char *remote_path = NULL;
+	char *mountpoint = NULL;
+	char *formatted = NULL;
+	GtkWidget *rclone_item;
+	GtkWidget *submenu;
+	GtkWidget *item;
+
+	service = nemo_rclone_service_get_default ();
+	selection = background ? NULL : nemo_view_get_selection (view);
+
+	if (selection != NULL) {
+		file = NEMO_FILE (selection->data);
+	} else {
+		file = nemo_view_get_directory_as_file (view);
+	}
+
+	if (file != NULL) {
+		local_path = nemo_file_get_path (file);
+
+		if (local_path != NULL &&
+		    nemo_rclone_service_path_to_remote (service, local_path,
+		                                        &remote, &remote_path,
+		                                        &mountpoint)) {
+			formatted = nemo_rclone_service_format_path (remote, remote_path);
+		}
+	}
+
+	if (selection != NULL) {
+		nemo_file_list_free (selection);
+	}
+
+	rclone_item = gtk_menu_item_new_with_label (_("Rclone"));
+	submenu = gtk_menu_new ();
+
+	item = gtk_menu_item_new_with_label (_("Open Rclone Transfer…"));
+	g_signal_connect (item, "activate",
+	                  G_CALLBACK (rclone_menu_open_window_cb), view);
+	gtk_menu_shell_append (GTK_MENU_SHELL (submenu), item);
+
+	if (local_path != NULL) {
+		item = gtk_menu_item_new_with_label (_("Mark as Rclone Favorite…"));
+		g_object_set_data_full (G_OBJECT (item), "rclone-local",
+		                        g_strdup (local_path), g_free);
+		if (remote != NULL) {
+			g_object_set_data_full (G_OBJECT (item), "rclone-remote",
+			                        g_strdup (remote), g_free);
+			g_object_set_data_full (G_OBJECT (item), "rclone-rpath",
+			                        g_strdup (remote_path), g_free);
+		}
+		g_signal_connect (item, "activate",
+		                  G_CALLBACK (rclone_menu_mark_favorite_cb), view);
+		gtk_menu_shell_append (GTK_MENU_SHELL (submenu), item);
+	}
+
+	if (formatted != NULL) {
+		item = gtk_menu_item_new_with_label (_("Copy rclone Path"));
+		g_object_set_data_full (G_OBJECT (item), "rclone-formatted",
+		                        g_strdup (formatted), g_free);
+		g_signal_connect (item, "activate",
+		                  G_CALLBACK (rclone_menu_copy_path_cb), view);
+		gtk_menu_shell_append (GTK_MENU_SHELL (submenu), item);
+
+		item = gtk_menu_item_new_with_label (_("Use as Rclone Source"));
+		g_object_set_data_full (G_OBJECT (item), "rclone-remote",
+		                        g_strdup (remote), g_free);
+		g_object_set_data_full (G_OBJECT (item), "rclone-rpath",
+		                        g_strdup (remote_path), g_free);
+		g_signal_connect (item, "activate",
+		                  G_CALLBACK (rclone_menu_use_source_cb), view);
+		gtk_menu_shell_append (GTK_MENU_SHELL (submenu), item);
+	}
+
+	gtk_menu_item_set_submenu (GTK_MENU_ITEM (rclone_item), submenu);
+	gtk_widget_show_all (rclone_item);
+	gtk_menu_shell_append (GTK_MENU_SHELL (menu), rclone_item);
+
+	g_free (local_path);
+	g_free (remote);
+	g_free (remote_path);
+	g_free (mountpoint);
+	g_free (formatted);
+}
+
 static GtkMenu *
 create_popup_menu (NemoView *view, const char *popup_path)
 {
@@ -6816,6 +6966,13 @@ create_popup_menu (NemoView *view, const char *popup_path)
 
 	menu = gtk_ui_manager_get_widget (nemo_window_get_ui_manager (view->details->window),
 					  popup_path);
+
+	if (g_strcmp0 (popup_path, NEMO_VIEW_POPUP_PATH_SELECTION) == 0 ||
+	    g_strcmp0 (popup_path, NEMO_VIEW_POPUP_PATH_BACKGROUND) == 0) {
+		append_rclone_menu (view, GTK_MENU (menu),
+		                    g_strcmp0 (popup_path, NEMO_VIEW_POPUP_PATH_BACKGROUND) == 0);
+	}
+
 	gtk_menu_set_screen (GTK_MENU (menu),
 			     gtk_widget_get_screen (GTK_WIDGET (view)));
 	gtk_widget_show (GTK_WIDGET (menu));
