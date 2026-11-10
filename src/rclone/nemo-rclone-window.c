@@ -11,6 +11,7 @@
 #include <config.h>
 
 #include "nemo-rclone-window.h"
+#include "nemo-rclone-path.h"
 #include "nemo-rclone-service.h"
 #include "nemo-window.h"
 #include "nemo-window-slot.h"
@@ -301,6 +302,15 @@ combo_active_text (GtkWidget *combo)
 	return gtk_combo_box_text_get_active_text (GTK_COMBO_BOX_TEXT (combo));
 }
 
+/* "~" in a path entry is a friendly spelling of the remote home (""). */
+static const char *
+entry_path_text (GtkWidget *entry)
+{
+	const char *text = gtk_entry_get_text (GTK_ENTRY (entry));
+
+	return g_strcmp0 (text, "~") == 0 ? "" : text;
+}
+
 static void
 set_combo_active_text (GtkWidget *combo,
                        const char *text)
@@ -341,8 +351,8 @@ on_start_clicked (GtkButton *button,
 	RcloneWindow *self = user_data;
 	char *remote_a = combo_active_text (self->remote_a);
 	char *remote_b = combo_active_text (self->remote_b);
-	const char *path_a = gtk_entry_get_text (GTK_ENTRY (self->path_a));
-	const char *path_b = gtk_entry_get_text (GTK_ENTRY (self->path_b));
+	const char *path_a = entry_path_text (self->path_a);
+	const char *path_b = entry_path_text (self->path_b);
 	char *src = NULL;
 	char *dst = NULL;
 	char *mode;
@@ -352,8 +362,7 @@ on_start_clicked (GtkButton *button,
 
 	(void) button;
 
-	if (remote_a == NULL || remote_b == NULL ||
-	    path_a[0] == '\0' || path_b[0] == '\0') {
+	if (remote_a == NULL || remote_b == NULL) {
 		gtk_label_set_text (GTK_LABEL (self->job_status),
 		                    _("Choose a source and a destination first."));
 		g_free (remote_a);
@@ -486,15 +495,7 @@ static char *
 path_join (const char *base,
            const char *name)
 {
-	if (base == NULL || base[0] == '\0' || g_strcmp0 (base, "/") == 0) {
-		return g_strdup_printf ("/%s", name);
-	}
-
-	if (base[strlen (base) - 1] == '/') {
-		return g_strconcat (base, name, NULL);
-	}
-
-	return g_strdup_printf ("%s/%s", base, name);
+	return nemo_rclone_path_join (base, name);
 }
 
 static void
@@ -557,7 +558,7 @@ browse_refresh (BrowseData *data)
 	}
 
 	gtk_entry_set_text (GTK_ENTRY (data->path_entry),
-	                    data->path != NULL && data->path[0] != '\0' ? data->path : "/");
+	                    data->path != NULL ? data->path : "");
 	g_free (spec);
 }
 
@@ -597,22 +598,13 @@ on_browse_up (GtkButton *button,
               gpointer user_data)
 {
 	BrowseData *data = user_data;
-	char *slash;
+	char *parent;
 
 	(void) button;
 
-	if (data->path == NULL || data->path[0] == '\0' ||
-	    g_strcmp0 (data->path, "/") == 0) {
-		return;
-	}
-
-	slash = strrchr (data->path, '/');
-	if (slash == NULL || slash == data->path) {
-		g_free (data->path);
-		data->path = g_strdup ("/");
-	} else {
-		*slash = '\0';
-	}
+	parent = nemo_rclone_path_parent (data->path);
+	g_free (data->path);
+	data->path = parent;
 
 	browse_refresh (data);
 }
@@ -626,8 +618,20 @@ on_browse_select (GtkButton *button,
 	(void) button;
 
 	gtk_entry_set_text (GTK_ENTRY (data->target_entry),
-	                    data->path != NULL && data->path[0] != '\0' ? data->path : "/");
+	                    data->path != NULL ? data->path : "");
 	gtk_widget_destroy (data->dialog);
+}
+
+static void
+on_browse_home (GtkButton *button,
+                gpointer user_data)
+{
+	BrowseData *data = user_data;
+
+	(void) button;
+	g_free (data->path);
+	data->path = g_strdup ("");
+	browse_refresh (data);
 }
 
 static void
@@ -639,6 +643,7 @@ open_browse_dialog (RcloneWindow *self,
 	GtkWidget *content;
 	GtkWidget *scroll;
 	GtkWidget *buttons;
+	GtkWidget *home_button;
 	GtkWidget *up_button;
 	GtkWidget *select_button;
 	GtkWidget *cancel_button;
@@ -654,7 +659,7 @@ open_browse_dialog (RcloneWindow *self,
 	data->service = self->service;
 	data->remote = remote;
 	data->target_entry = path_entry;
-	data->path = g_strdup (gtk_entry_get_text (GTK_ENTRY (path_entry)));
+	data->path = nemo_rclone_path_canonicalize (entry_path_text (path_entry));
 
 	data->dialog = gtk_dialog_new ();
 	gtk_window_set_title (GTK_WINDOW (data->dialog), _("Choose an rclone path"));
@@ -668,8 +673,10 @@ open_browse_dialog (RcloneWindow *self,
 	gtk_box_pack_start (GTK_BOX (content), vbox, TRUE, TRUE, 0);
 
 	data->path_entry = gtk_entry_new ();
+	gtk_entry_set_placeholder_text (GTK_ENTRY (data->path_entry),
+	                                _("~ = remote home (empty), or a relative/absolute path"));
 	gtk_entry_set_text (GTK_ENTRY (data->path_entry),
-	                    data->path != NULL ? data->path : "/");
+	                    data->path != NULL ? data->path : "");
 	gtk_box_pack_start (GTK_BOX (vbox), data->path_entry, FALSE, FALSE, 0);
 
 	data->store = gtk_list_store_new (1, G_TYPE_STRING);
@@ -697,6 +704,12 @@ open_browse_dialog (RcloneWindow *self,
 	up_button = gtk_button_new_with_label (_("Up"));
 	g_signal_connect (up_button, "clicked", G_CALLBACK (on_browse_up), data);
 	gtk_container_add (GTK_CONTAINER (buttons), up_button);
+
+	home_button = gtk_button_new_with_label (_("Home"));
+	gtk_widget_set_tooltip_text (home_button,
+	                             _("Jump to the remote's login home (the safe root for Termux)."));
+	g_signal_connect (home_button, "clicked", G_CALLBACK (on_browse_home), data);
+	gtk_container_add (GTK_CONTAINER (buttons), home_button);
 
 	select_button = gtk_button_new_with_label (_("Select"));
 	g_signal_connect (select_button, "clicked", G_CALLBACK (on_browse_select), data);
@@ -878,41 +891,6 @@ on_favorite_remove (GtkButton *button,
 
 /* --------------------------- rclone:// handling --------------------------- */
 
-static char *
-normalize_path (const char *path)
-{
-	char *normalized;
-	gsize len;
-
-	if (path == NULL || path[0] == '\0') {
-		return g_strdup ("/");
-	}
-
-	normalized = path[0] == '/' ? g_strdup (path) : g_strconcat ("/", path, NULL);
-
-	len = strlen (normalized);
-	while (len > 1 && normalized[len - 1] == '/') {
-		normalized[--len] = '\0';
-	}
-
-	return normalized;
-}
-
-static gboolean
-path_is_under (const char *path,
-               const char *prefix)
-{
-	gsize len;
-
-	if (prefix == NULL || prefix[0] == '\0' || g_strcmp0 (prefix, "/") == 0) {
-		return TRUE;
-	}
-
-	len = strlen (prefix);
-	return g_str_has_prefix (path, prefix) &&
-	       (path[len] == '\0' || path[len] == '/');
-}
-
 static void
 show_mount_error (GtkWindow *parent,
                   const char *mountpoint,
@@ -1073,40 +1051,45 @@ find_favorite_for (NemoRcloneService *service,
 {
 	GPtrArray *favorites = nemo_rclone_service_get_favorites (service);
 	NemoRcloneFavorite *best = NULL;
-	char *wanted = normalize_path (path);
+	char *wanted = nemo_rclone_path_canonicalize (path);
+	char *best_relative = NULL;
 	gsize best_len = 0;
 	guint i;
 
 	for (i = 0; i < favorites->len; i++) {
 		NemoRcloneFavorite *favorite = g_ptr_array_index (favorites, i);
 		char *favorite_path;
+		char *relative;
 		gsize len;
 
 		if (g_strcmp0 (favorite->remote, remote) != 0) {
 			continue;
 		}
 
-		favorite_path = normalize_path (favorite->path);
-		if (!path_is_under (wanted, favorite_path)) {
+		favorite_path = nemo_rclone_path_canonicalize (favorite->path);
+		relative = nemo_rclone_path_relative (wanted, favorite_path);
+		if (relative == NULL) {
 			g_free (favorite_path);
 			continue;
 		}
 
-		len = g_strcmp0 (favorite_path, "/") == 0 ? 0 : strlen (favorite_path);
+		len = strlen (favorite_path);
 		if (best == NULL || len > best_len) {
 			best = favorite;
 			best_len = len;
+			g_free (best_relative);
+			best_relative = relative;
+		} else {
+			g_free (relative);
 		}
 
 		g_free (favorite_path);
 	}
 
 	if (best != NULL && relative_out != NULL) {
-		const char *relative = wanted + best_len;
-		while (relative[0] == '/') {
-			relative++;
-		}
-		*relative_out = g_strdup (relative);
+		*relative_out = best_relative;
+	} else {
+		g_free (best_relative);
 	}
 
 	g_free (wanted);
@@ -1155,7 +1138,7 @@ nemo_rclone_open_uri (GtkWindow *parent,
 
 		if (slash == NULL) {
 			escaped_remote = g_strdup (trimmed);
-			escaped_path = g_strdup ("/");
+			escaped_path = g_strdup ("");
 		} else {
 			escaped_remote = g_strndup (trimmed, slash - trimmed);
 			escaped_path = g_strdup (slash);
@@ -1175,6 +1158,28 @@ nemo_rclone_open_uri (GtkWindow *parent,
 		g_free (escaped_path);
 	}
 	g_free (trimmed);
+
+	/* URI spelling:
+	   rclone://remote          -> remote home (default root)
+	   rclone://remote/rel      -> relative to home
+	   rclone://remote//abs     -> absolute server path
+	*/
+	if (path[0] == '/') {
+		if (path[1] == '/') {
+			/* Keep the leading slash, drop the URI separator. */
+			memmove (path, path + 1, strlen (path));
+		} else {
+			/* A single slash is the URI path separator, not part of
+			   the remote path. */
+			memmove (path, path + 1, strlen (path));
+		}
+	}
+
+	{
+		char *canonical = nemo_rclone_path_canonicalize (path);
+		g_free (path);
+		path = canonical;
+	}
 
 	if (remote[0] == '\0') {
 		g_free (remote);
@@ -1443,7 +1448,8 @@ build_transfer_tab (RcloneWindow *self)
 	gtk_grid_attach (GTK_GRID (grid), self->remote_a, 1, 0, 1, 1);
 
 	self->path_a = gtk_entry_new ();
-	gtk_entry_set_placeholder_text (GTK_ENTRY (self->path_a), _("/path/on/remote"));
+	gtk_entry_set_placeholder_text (GTK_ENTRY (self->path_a),
+	                                _("~ or path (empty = remote home)"));
 	gtk_widget_set_hexpand (self->path_a, TRUE);
 	gtk_grid_attach (GTK_GRID (grid), self->path_a, 2, 0, 1, 1);
 
@@ -1462,7 +1468,8 @@ build_transfer_tab (RcloneWindow *self)
 	gtk_grid_attach (GTK_GRID (grid), self->remote_b, 1, 1, 1, 1);
 
 	self->path_b = gtk_entry_new ();
-	gtk_entry_set_placeholder_text (GTK_ENTRY (self->path_b), _("/path/on/remote"));
+	gtk_entry_set_placeholder_text (GTK_ENTRY (self->path_b),
+	                                _("~ or path (empty = remote home)"));
 	gtk_widget_set_hexpand (self->path_b, TRUE);
 	gtk_grid_attach (GTK_GRID (grid), self->path_b, 2, 1, 1, 1);
 

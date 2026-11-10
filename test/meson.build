@@ -35,3 +35,12 @@ test('Content Search test',
   ),
   args: []
 )
+
+test('Rclone path semantics',
+  executable('test-rclone-path',
+    [ 'rclone-path-test.c', '../src/rclone/nemo-rclone-path.c' ],
+    include_directories: [ rootInclude, include_directories('../src/rclone') ],
+    dependencies: [ glib ],
+  ),
+  args: []
+)

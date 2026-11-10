@@ -154,3 +154,99 @@ ninja -C build
 sudo ninja -C build install && sudo ldconfig
 nemo -q   # 重启生效
 ```
+
+---
+
+## 6. v2 计划（2026-11-10）—— 从“能挂载”到“全能文件管理器”
+
+### 6.1 用户当前优先级
+1. **Termux / SFTP favorite 挂载失败**（当前最痛，先修）。
+2. **进度窗口一次只能跑一个任务**；需要统一的 Job 查询页面 + 美化进度界面。
+3. **FUSE 表现**：慢网盘不卡、不假死、进度真实。
+4. **跨电脑访问/复制**：任何 rclone remote 都能像本地盘一样用。
+
+### 6.2 根因（已用代码 + 实机验证）
+- **Termux 挂载失败不是 mount 失败，而是路径语义错误**：
+  - favorite 里存 `/` → `format_path()` 生成 `remote:/`。rclone SFTP 把前导 `/` 当**服务器绝对根**（Android `/`，不可读）；
+    留空才是 `remote:`，rclone 会落到 **Termux home** `/data/data/com.termux/files/home`。
+  - 实测：`rclone lsd gt20:` 成功；`rclone lsd gt20:/` → `permission denied`；
+    `rclone mount gt20: …` 能列出 home；`rclone mount gt20:/ …` 挂载点 `ls` 返回 EPERM。
+  - 浏览对话框也从 `/` 起步，`path_join()` 永远补前导 `/`，所以“Add favorite”会重复制造同样的坏路径；
+    且 Add 对话框当前**拒绝空 path**，用户无法表达“remote home”。
+  - `gt20` 还有一条 `/home` favorite，Termux 上不存在，属于脏数据。
+- **进度单进程**：`RcloneWindow` 只有一个 `self->process`、一个 `job_progress`、一个 `job_log`；
+  第二次 Start 会覆盖第一个，两个回调写同一组控件，`finish_job()` 还可能清掉第二个进程。
+- **FUSE 假进度**：copy 进 `--vfs-cache-mode full` 挂载点时，Nemo 看到的是写入 VFS cache 的字节，
+  上传还没开始；Nemo 自带 File Operations 其实支持多任务，但这里的“100%”不代表远端完成。
+- **FUSE 假死风险**：`nemo-directory-async.c` 的 `g_file_query_info_async` / enumerate 没有超时，
+  网络断了会一直转圈；全局 `MAX_ASYNC_JOBS=10`，没有 per-mount 限流。
+
+### 6.3 目标架构（细节已定）
+**浏览走 FUSE，传输走 rclone 原生任务，统计走 RC socket，UI 统一到一个 Jobs 页。**
+
+```
+Nemo 视图 ── FUSE mount ── rclone VFS ── remote
+   │
+   ├─ Nemo File Operations (本地/挂载复制) ─┐
+   ├─ rclone transfer job (copy/move/sync) ─┼─→ NemoRcloneJobManager ─→ Jobs 页
+   └─ mount VFS upload queue (vfs/queue) ───┘        │
+                                                     └─ 状态图标 / 通知 / 侧边栏
+```
+
+- **每个 transfer job 一个独立 rclone 进程**，带自己的 Unix RC socket：
+  ```
+  rclone copy SRC DST --rc --rc-addr unix://$XDG_RUNTIME_DIR/nemo-rclone/jobs/<id>.sock \
+    --rc-no-auth --stats 1s --log-file ~/.cache/nemo-rclone/jobs/<id>.log ...
+  ```
+  UI 轮询 `core/stats`（bytes/totalBytes/speed/eta/transferring[]），取消用 `core/quit`。
+  这样 job 并行、进度独立、Nemo 关窗不影响；sidecar JSON 记录 src/dst/mode/pid/socket，重启后可重连。
+- **每个 mount 也加 `--rc` socket**，轮询 `vfs/queue` + `vfs/stats` + `core/stats`，
+  把“上传队列 / 缓存大小 / 上传中文件”显示成 Jobs 页里的第二类任务。
+- **Jobs 页同时聚合 Nemo 自己的 `NemoProgressInfo`**：两个本地/挂载复制也会同时显示，
+  彻底解决“同时复制两个路径只看到一个”的体验问题。
+- 不引入中心 `rclone rcd` 守护进程（先降低风险）；per-process RC 已能提供统一查询。
+  以后若需要跨重启的完整 job 历史，再迁移到 systemd `rclone rcd`。
+
+### 6.4 里程碑（按顺序推进，每步 commit + push）
+- **P0 Termux / 路径语义修复 — ✅ 已完成（2026-11-10）**
+  - `format_path`：空 path → `remote:`；相对 path → `remote:rel`；绝对 path → `remote:/abs`。
+  - 浏览对话框从 home（空）起步；`path_join` / parent 保留相对/绝对语义；UI 用 `~` 显示 home。
+  - Add Favorite 允许空 path，加 **Home** 按钮与提示；启动时自动修复 Termux 脏 favorite
+    （`/` 或 `/home` → home），保留 `m64:/home/roychong` 这类真实绝对路径。
+  - 新增 `nemo-rclone-path.[ch]` 统一路径语义 + `test/rclone-path-test.c`（`meson test` 可跑）。
+  - 修复 rclone.conf 解析 bug：真实配置是 `key = value`（带空格），旧代码按 `key=` 匹配，
+    导致 Termux 检测恒为 false、自动修复从未生效。
+  - 同一 remote+path 的重复 favorite 自动去重。
+  - 实测（lgv35，Termux/SFTP 8022）：favorite 自动修复为 `""`，`rclone mount` 成功挂到
+    `~/.local/share/nemo-rclone/mounts/lgv35`，`ls` 列出 Termux home，unmount 干净退出。
+- **P1 并行 Job + 统一 Jobs 页**
+  - 新 `src/rclone/nemo-rclone-job.[ch]`、`nemo-rclone-job-manager.[ch]`、`nemo-rclone-rc.[ch]`。
+  - 多 job 并行，互不覆盖；每个 job 独立进度/日志/取消/重试。
+  - Jobs 页：顶部总览（N 个任务 / 总速度 / 剩余）、任务列表（状态、进度条、速度、ETA）、
+    详情（当前文件列表、日志、取消/重试、打开目标）。
+  - 聚合 Nemo 自带 File Operations；关窗后台继续；完成/失败发 `GNotification`；侧边栏 Transfers 显示计数。
+  - 进度界面美化：CSS class、状态色、图标、平滑更新（≤4Hz）、不再闪。
+- **P2 RC 统计 / FUSE 上传可见**
+  - mount argv 加 `--rc` socket；JobManager 轮询 `vfs/queue`、`vfs/stats`。
+  - copy 进挂载点后，Nemo 进度到 100% 时 Jobs 页继续显示 “Uploading to <remote>” 直到 queue 清空。
+  - 后续可加“直接传输”开关：检测到目标是 rclone mount 时，copy/paste 直接起 rclone job（真进度、避免双缓存）。
+- **P3 FUSE 性能 / 稳定性**
+  - mount profile（balanced / browse-fast / upload-heavy / low-power-SFTP）存 favorite JSON；
+    增加 `--vfs-cache-max-size`、`--vfs-cache-max-age`、`--vfs-write-back`、`--buffer-size`、
+    `--timeout`、`--contimeout`、`--low-level-retries`；Termux 手机降 `--sftp-concurrency` / `--transfers`。
+  - `nemo-directory-async.c`：慢远程 IO 超时 watchdog（取消并显示重试）、per-mount 并发上限；
+    thumbnail 路径避免主线程同步 `g_file_query_info`。
+  - path-keyed view-state（zoom/sort）存 JSON，修 remount 后缩放重置。
+- **P4 跨电脑 / 深度集成**
+  - 侧边栏列出全部 remotes（不只 favorite），点开自动挂 home/默认路径。
+  - 右键 **Send to…** / **Copy to remote…**：选目标 remote/path，起 job；多选按 batch 显示。
+  - `--server-side-across-configs` 可选；跨机器复制走 rclone 任务，不再依赖 Nemo 的 FUSE copy。
+  - systemd user mount 单元（Restart=on-failure、登出清理、per-mount rc socket）作为 P3/P4 收尾。
+
+### 6.5 验证清单
+- `rclone lsd gt20:` 成功；`nemo rclone://gt20/` 打开的是 Termux home，日志无 `permission denied`。
+- 同时启动两个 transfer（gt20→m64、m64→d3180），Jobs 页两行独立进度；取消一个不影响另一个。
+- 复制 1GB 到挂载点：Nemo 到 100% 后 Jobs 页仍显示 upload queue，queue 归零后任务完成。
+- 断网/iptables DROP 后打开远程目录，30s 内出现错误/重试，不无限转圈。
+- 关掉 Nemo 再打开，Jobs 页能重连仍在运行的 job/mount socket（至少显示活动任务）。
+

@@ -11,6 +11,7 @@
 #include <config.h>
 
 #include "nemo-rclone-service.h"
+#include "nemo-rclone-path.h"
 
 #include <gio/gio.h>
 #include <gio/gunixmounts.h>
@@ -43,10 +44,9 @@ gboolean nemo_rclone_service_unmount_favorite (NemoRcloneService *self,
                                                const char        *id,
                                                GError           **error);
 
-static char     *normalize_remote_path   (const char *path);
-static gboolean  path_is_under           (const char *path,
-                                          const char *prefix);
 gboolean         nemo_rclone_service_is_mount_active (const char *mountpoint);
+
+static void      save_favorites (NemoRcloneService *self);
 
 static void
 nemo_rclone_service_finalize (GObject *object)
@@ -311,11 +311,198 @@ favorite_from_json (JsonObject *object)
 	return favorite;
 }
 
+/* Read one key from a section of rclone.conf.  Returns a newly allocated
+   string, or NULL when the section/key is missing.  This only reads
+   non-secret keys (type/port/user), and never logs values. */
+static char *
+remote_config_value (const char *remote,
+                     const char *key)
+{
+	char *path;
+	char *contents = NULL;
+	char *section;
+	char *result = NULL;
+	char **lines;
+	gboolean in_section = FALSE;
+	guint i;
+
+	if (remote == NULL || remote[0] == '\0') {
+		return NULL;
+	}
+
+	path = g_strdup (g_getenv ("RCLONE_CONFIG"));
+	if (path == NULL) {
+		path = g_build_filename (g_get_user_config_dir (), "rclone",
+		                         "rclone.conf", NULL);
+	}
+
+	if (!g_file_get_contents (path, &contents, NULL, NULL)) {
+		g_free (path);
+		return NULL;
+	}
+
+	section = g_strdup_printf ("[%s]", remote);
+	lines = g_strsplit (contents, "\n", -1);
+
+	for (i = 0; lines[i] != NULL; i++) {
+		char *line = g_strstrip (lines[i]);
+		char *equals;
+		char *name;
+
+		if (line[0] == '[') {
+			in_section = g_strcmp0 (line, section) == 0;
+			continue;
+		}
+
+		if (!in_section || line[0] == '\0' || line[0] == '#' ||
+		    line[0] == ';') {
+			continue;
+		}
+
+		/* rclone.conf writes "key = value" (spaces around '='), so
+		   compare the trimmed key instead of assuming "key=". */
+		equals = strchr (line, '=');
+		if (equals == NULL) {
+			continue;
+		}
+
+		name = g_strndup (line, equals - line);
+		g_strstrip (name);
+
+		if (g_strcmp0 (name, key) == 0) {
+			result = g_strdup (g_strstrip (equals + 1));
+			g_free (name);
+			break;
+		}
+
+		g_free (name);
+	}
+
+	g_strfreev (lines);
+	g_free (section);
+	g_free (contents);
+	g_free (path);
+
+	return result;
+}
+
+/* Termux's OpenSSH SFTP server exposes Android's real filesystem.  Its
+   server root "/" is not listable; the login home is the useful root.
+   Detect the common Termux signature (port 8022 or a u0_a* Android user)
+   so we can repair path semantics created by older builds. */
+static gboolean
+remote_is_termux (const char *remote)
+{
+	char *type;
+	char *port;
+	char *user;
+	gboolean termux = FALSE;
+
+	type = remote_config_value (remote, "type");
+	port = remote_config_value (remote, "port");
+	user = remote_config_value (remote, "user");
+
+	if (g_strcmp0 (type, "sftp") == 0) {
+		if (g_strcmp0 (port, "8022") == 0) {
+			termux = TRUE;
+		} else if (user != NULL && g_str_has_prefix (user, "u0_a")) {
+			termux = TRUE;
+		}
+	}
+
+	g_free (type);
+	g_free (port);
+	g_free (user);
+	return termux;
+}
+
+/* Old builds stored "/" for the remote root and "/home" for a guessed
+   Termux home.  Both are absolute Android paths, so the mount came up empty
+   with "permission denied".  Rewrite those to "", and turn the explicit
+   Termux home prefix into a relative path. */
+static gboolean
+repair_favorite_path (NemoRcloneFavorite *favorite)
+{
+	char *new_path = NULL;
+
+	if (!remote_is_termux (favorite->remote)) {
+		return FALSE;
+	}
+
+	if (favorite->path == NULL || favorite->path[0] == '\0') {
+		return FALSE;
+	}
+
+	if (g_strcmp0 (favorite->path, "/") == 0 ||
+	    g_strcmp0 (favorite->path, "/home") == 0) {
+		new_path = g_strdup ("");
+	} else if (g_strcmp0 (favorite->path,
+	                      "/data/data/com.termux/files/home") == 0) {
+		new_path = g_strdup ("");
+	} else if (g_str_has_prefix (favorite->path,
+	                             "/data/data/com.termux/files/home/")) {
+		new_path = g_strdup (favorite->path +
+		                     strlen ("/data/data/com.termux/files/home/"));
+	}
+
+	if (new_path == NULL) {
+		return FALSE;
+	}
+
+	g_message ("nemo-rclone: repairing Termux favorite %s: \"%s\" -> \"%s\"",
+	           favorite->remote, favorite->path,
+	           new_path[0] != '\0' ? new_path : "(home)");
+
+	/* If the label was auto-generated from the old path, regenerate it so
+	   the sidebar does not keep showing "gt20:/". */
+	{
+		char *old_spec = nemo_rclone_service_format_path (favorite->remote,
+		                                                 favorite->path);
+
+		if (g_strcmp0 (favorite->label, old_spec) == 0) {
+			char *new_label = nemo_rclone_service_format_path (favorite->remote,
+			                                                  new_path);
+			g_free (favorite->label);
+			favorite->label = new_label;
+		}
+
+		g_free (old_spec);
+	}
+
+	g_free (favorite->path);
+	favorite->path = new_path;
+	return TRUE;
+}
+
+/* True when both favorites point at the same remote path, ignoring trailing
+   slashes.  Used to collapse duplicates created by older builds. */
+static gboolean
+favorite_same_target (NemoRcloneFavorite *a,
+                      NemoRcloneFavorite *b)
+{
+	char *a_path;
+	char *b_path;
+	gboolean same;
+
+	if (g_strcmp0 (a->remote, b->remote) != 0) {
+		return FALSE;
+	}
+
+	a_path = nemo_rclone_path_canonicalize (a->path);
+	b_path = nemo_rclone_path_canonicalize (b->path);
+	same = g_strcmp0 (a_path, b_path) == 0;
+	g_free (a_path);
+	g_free (b_path);
+
+	return same;
+}
+
 static void
 load_favorites (NemoRcloneService *self)
 {
 	char *contents = NULL;
 	JsonParser *parser;
+	gboolean repaired = FALSE;
 
 	g_ptr_array_set_size (self->favorites, 0);
 
@@ -342,7 +529,30 @@ load_favorites (NemoRcloneService *self)
 							favorite_from_json (json_node_get_object (node));
 
 						if (favorite->remote[0] != '\0') {
-							g_ptr_array_add (self->favorites, favorite);
+							gboolean duplicate = FALSE;
+
+							if (repair_favorite_path (favorite)) {
+								repaired = TRUE;
+							}
+
+							for (guint j = 0; j < self->favorites->len; j++) {
+								NemoRcloneFavorite *existing =
+									g_ptr_array_index (self->favorites, j);
+
+								if (favorite_same_target (existing, favorite)) {
+									duplicate = TRUE;
+									break;
+								}
+							}
+
+							if (duplicate) {
+								g_message ("nemo-rclone: dropping duplicate favorite %s: \"%s\"",
+								           favorite->remote, favorite->path);
+								repaired = TRUE;
+								nemo_rclone_service_favorite_free (favorite);
+							} else {
+								g_ptr_array_add (self->favorites, favorite);
+							}
 						} else {
 							nemo_rclone_service_favorite_free (favorite);
 						}
@@ -354,6 +564,10 @@ load_favorites (NemoRcloneService *self)
 
 	g_object_unref (parser);
 	g_free (contents);
+
+	if (repaired) {
+		save_favorites (self);
+	}
 }
 
 static void
@@ -498,19 +712,26 @@ char *
 nemo_rclone_service_format_path (const char *remote,
                                  const char *path)
 {
+	char *canonical;
+	char *result;
+
 	if (remote == NULL) {
 		return g_strdup (path != NULL ? path : "");
 	}
 
-	if (path == NULL || path[0] == '\0') {
-		return g_strdup_printf ("%s:", remote);
+	canonical = nemo_rclone_path_canonicalize (path);
+
+	if (canonical[0] == '\0') {
+		result = g_strdup_printf ("%s:", remote);
+	} else {
+		/* Do not add a leading slash: rclone treats "/foo" as an absolute
+		   server path and "foo" as relative to the remote's default root
+		   (the login home for SFTP/Termux). */
+		result = g_strdup_printf ("%s:%s", remote, canonical);
 	}
 
-	if (path[0] == '/') {
-		return g_strdup_printf ("%s:%s", remote, path);
-	}
-
-	return g_strdup_printf ("%s:/%s", remote, path);
+	g_free (canonical);
+	return result;
 }
 
 /* Find the longest mount point containing path with an rclone FUSE type. */
@@ -610,15 +831,11 @@ nemo_rclone_service_path_to_remote (NemoRcloneService *self,
 
 	if (found && found_remote != NULL) {
 		relative = (char *) local_path + strlen (mount_path);
-		if (relative[0] == '\0') {
-			relative = (char *) "/";
+		while (relative[0] == '/') {
+			relative++;
 		}
 
-		if (base_path != NULL && base_path[0] != '\0') {
-			result = g_strconcat (base_path, relative, NULL);
-		} else {
-			result = g_strdup (relative);
-		}
+		result = nemo_rclone_path_join (base_path, relative);
 
 		if (remote != NULL) {
 			*remote = found_remote;
@@ -662,14 +879,16 @@ nemo_rclone_service_path_to_remote (NemoRcloneService *self,
 		}
 
 		relative = (char *) local_path + len;
+		while (relative[0] == '/') {
+			relative++;
+		}
 
 		if (remote != NULL) {
 			*remote = g_strdup (favorite->remote);
 		}
 		if (remote_path != NULL) {
-			*remote_path = g_strconcat (favorite->path,
-			                            relative[0] != '\0' ? relative : "/",
-			                            NULL);
+			*remote_path = nemo_rclone_path_join (favorite->path,
+			                                     relative);
 		}
 		if (mountpoint != NULL) {
 			*mountpoint = g_strdup (favorite->mountpoint);
@@ -699,7 +918,7 @@ nemo_rclone_service_remote_to_local (NemoRcloneService *self,
 
 	nemo_rclone_service_get_favorites (self);
 
-	wanted = normalize_remote_path (path);
+	wanted = nemo_rclone_path_canonicalize (path);
 
 	/* Prefer an active rclone mount whose source path is the longest prefix
 	   of the requested path.  This makes multiple favorites on the same
@@ -727,18 +946,15 @@ nemo_rclone_service_remote_to_local (NemoRcloneService *self,
 			continue;
 		}
 
-		source_path = normalize_remote_path (colon + 1);
-		source_len = g_strcmp0 (source_path, "/") == 0 ? 0 : strlen (source_path);
+		source_path = nemo_rclone_path_canonicalize (colon + 1);
+		source_len = strlen (source_path);
 
-		if (!path_is_under (wanted, source_path) ||
+		relative = nemo_rclone_path_relative (wanted, source_path);
+		if (relative == NULL ||
 		    (have_match && source_len <= best_prefix_len)) {
+			g_free (relative);
 			g_free (source_path);
 			continue;
-		}
-
-		relative = wanted + source_len;
-		while (relative[0] == '/') {
-			relative++;
 		}
 
 		mount_path = g_unix_mount_get_mount_path (entry);
@@ -753,6 +969,7 @@ nemo_rclone_service_remote_to_local (NemoRcloneService *self,
 		best_prefix_len = source_len;
 		have_match = TRUE;
 
+		g_free (relative);
 		g_free (source_path);
 	}
 
@@ -827,48 +1044,6 @@ nemo_rclone_service_slugify (const char *label)
 	return start;
 }
 
-/* Normalise an rclone path: always starts with '/', no trailing slash
-   (except for the root, which is "/").  Caller frees. */
-static char *
-normalize_remote_path (const char *path)
-{
-	char *normalized;
-	gsize len;
-
-	if (path == NULL || path[0] == '\0') {
-		return g_strdup ("/");
-	}
-
-	if (path[0] == '/') {
-		normalized = g_strdup (path);
-	} else {
-		normalized = g_strconcat ("/", path, NULL);
-	}
-
-	len = strlen (normalized);
-	while (len > 1 && normalized[len - 1] == '/') {
-		normalized[--len] = '\0';
-	}
-
-	return normalized;
-}
-
-/* Whether remote:path from a mount entry is a prefix of path. */
-static gboolean
-path_is_under (const char *path,
-               const char *prefix)
-{
-	gsize len;
-
-	if (prefix == NULL || prefix[0] == '\0' || g_strcmp0 (prefix, "/") == 0) {
-		return TRUE;
-	}
-
-	len = strlen (prefix);
-	return g_str_has_prefix (path, prefix) &&
-	       (path[len] == '\0' || path[len] == '/');
-}
-
 /* Directory under which per-favorite mounts live. */
 static char *
 mount_base_dir (void)
@@ -912,8 +1087,8 @@ mountpoint_claimed_by_other (NemoRcloneService *self,
 		}
 
 		if (g_strcmp0 (fav->remote, remote) == 0) {
-			char *fav_path = normalize_remote_path (fav->path);
-			char *wanted_path = normalize_remote_path (path);
+			char *fav_path = nemo_rclone_path_canonicalize (fav->path);
+			char *wanted_path = nemo_rclone_path_canonicalize (path);
 
 			same_target = g_strcmp0 (fav_path, wanted_path) == 0;
 			g_free (fav_path);
@@ -938,7 +1113,7 @@ mountpoint_active_by_other (const char *candidate,
 	GList *mounts;
 	GList *l;
 	gboolean other = FALSE;
-	char *wanted = normalize_remote_path (path);
+	char *wanted = nemo_rclone_path_canonicalize (path);
 
 	mounts = g_unix_mounts_get (NULL);
 
@@ -957,7 +1132,7 @@ mountpoint_active_by_other (const char *candidate,
 
 		if (strncmp (source, remote, colon - source) == 0 &&
 		    (gsize) (colon - source) == strlen (remote)) {
-			char *source_path = normalize_remote_path (colon + 1);
+			char *source_path = nemo_rclone_path_canonicalize (colon + 1);
 
 			if (g_strcmp0 (source_path, wanted) != 0) {
 				other = TRUE;
@@ -1023,7 +1198,7 @@ char *
 nemo_rclone_service_format_uri (const char *remote,
                                 const char *path)
 {
-	char *normalized;
+	char *canonical;
 	char *escaped_remote;
 	char *escaped_path;
 	char *uri;
@@ -1032,14 +1207,26 @@ nemo_rclone_service_format_uri (const char *remote,
 		return g_strdup ("rclone://transfer");
 	}
 
-	normalized = normalize_remote_path (path);
+	canonical = nemo_rclone_path_canonicalize (path);
 	escaped_remote = g_uri_escape_string (remote, NULL, TRUE);
-	escaped_path = g_uri_escape_string (normalized, "/", TRUE);
-	uri = g_strdup_printf ("rclone://%s%s", escaped_remote, escaped_path);
+
+	if (canonical[0] == '\0') {
+		/* rclone://remote means the remote's default root (home). */
+		uri = g_strdup_printf ("rclone://%s", escaped_remote);
+	} else if (canonical[0] == '/') {
+		/* rclone://remote//abs/path: the second slash marks an absolute
+		   server path, distinct from a path relative to the home. */
+		escaped_path = g_uri_escape_string (canonical, "/", TRUE);
+		uri = g_strdup_printf ("rclone://%s/%s", escaped_remote, escaped_path);
+		g_free (escaped_path);
+	} else {
+		escaped_path = g_uri_escape_string (canonical, "/", TRUE);
+		uri = g_strdup_printf ("rclone://%s/%s", escaped_remote, escaped_path);
+		g_free (escaped_path);
+	}
 
 	g_free (escaped_remote);
-	g_free (escaped_path);
-	g_free (normalized);
+	g_free (canonical);
 
 	return uri;
 }
@@ -1518,6 +1705,16 @@ nemo_rclone_service_unmount_favorite (NemoRcloneService *self,
 
 	return spawned;
 }
+static void
+on_favorite_home_clicked (GtkButton *button,
+                          gpointer user_data)
+{
+	GtkWidget *entry = user_data;
+
+	(void) button;
+	gtk_entry_set_text (GTK_ENTRY (entry), "");
+}
+
 void
 nemo_rclone_service_prompt_add_favorite (NemoRcloneService *self,
                                          GtkWindow *parent,
@@ -1530,6 +1727,8 @@ nemo_rclone_service_prompt_add_favorite (NemoRcloneService *self,
 	GtkWidget *label_entry;
 	GtkWidget *remote_combo;
 	GtkWidget *path_entry;
+	GtkWidget *home_button;
+	GtkWidget *path_box;
 	GtkWidget *hint_label;
 	char *remote = NULL;
 	char *remote_path = NULL;
@@ -1587,10 +1786,21 @@ nemo_rclone_service_prompt_add_favorite (NemoRcloneService *self,
 	gtk_grid_attach (GTK_GRID (grid), remote_combo, 1, 1, 2, 1);
 
 	gtk_grid_attach (GTK_GRID (grid), gtk_label_new (_("Path:")), 0, 2, 1, 1);
+	path_box = gtk_box_new (GTK_ORIENTATION_HORIZONTAL, 6);
 	path_entry = gtk_entry_new ();
-	gtk_entry_set_placeholder_text (GTK_ENTRY (path_entry), _("/data/backup"));
+	gtk_entry_set_placeholder_text (GTK_ENTRY (path_entry),
+	                                _("empty = remote home (recommended for Termux)"));
 	gtk_widget_set_hexpand (path_entry, TRUE);
-	gtk_grid_attach (GTK_GRID (grid), path_entry, 1, 2, 2, 1);
+	gtk_box_pack_start (GTK_BOX (path_box), path_entry, TRUE, TRUE, 0);
+
+	home_button = gtk_button_new_with_label (_("Home"));
+	gtk_widget_set_tooltip_text (home_button,
+	                             _("Use the remote's login home instead of an absolute path. "
+	                               "Termux can only list its home, not Android's / root."));
+	gtk_box_pack_start (GTK_BOX (path_box), home_button, FALSE, FALSE, 0);
+	gtk_grid_attach (GTK_GRID (grid), path_box, 1, 2, 2, 1);
+	g_signal_connect (home_button, "clicked",
+	                  G_CALLBACK (on_favorite_home_clicked), path_entry);
 
 	hint_label = gtk_label_new (NULL);
 	gtk_label_set_xalign (GTK_LABEL (hint_label), 0.0);
@@ -1649,11 +1859,11 @@ nemo_rclone_service_prompt_add_favorite (NemoRcloneService *self,
 				GTK_COMBO_BOX_TEXT (remote_combo));
 		}
 
-		if (selected_remote == NULL || path[0] == '\0') {
+		if (selected_remote == NULL) {
 			GtkWidget *error = gtk_message_dialog_new (
 				parent, GTK_DIALOG_MODAL,
 				GTK_MESSAGE_ERROR, GTK_BUTTONS_CLOSE,
-				_("A remote and a path are required."));
+				_("A remote is required."));
 			gtk_dialog_run (GTK_DIALOG (error));
 			gtk_widget_destroy (error);
 		} else {
