@@ -219,13 +219,18 @@ Nemo 视图 ── FUSE mount ── rclone VFS ── remote
   - 同一 remote+path 的重复 favorite 自动去重。
   - 实测（lgv35，Termux/SFTP 8022）：favorite 自动修复为 `""`，`rclone mount` 成功挂到
     `~/.local/share/nemo-rclone/mounts/lgv35`，`ls` 列出 Termux home，unmount 干净退出。
-- **P1 并行 Job + 统一 Jobs 页**
-  - 新 `src/rclone/nemo-rclone-job.[ch]`、`nemo-rclone-job-manager.[ch]`、`nemo-rclone-rc.[ch]`。
-  - 多 job 并行，互不覆盖；每个 job 独立进度/日志/取消/重试。
-  - Jobs 页：顶部总览（N 个任务 / 总速度 / 剩余）、任务列表（状态、进度条、速度、ETA）、
-    详情（当前文件列表、日志、取消/重试、打开目标）。
-  - 聚合 Nemo 自带 File Operations；关窗后台继续；完成/失败发 `GNotification`；侧边栏 Transfers 显示计数。
-  - 进度界面美化：CSS class、状态色、图标、平滑更新（≤4Hz）、不再闪。
+- **P1 并行 Job + 统一 Jobs 页** — 🚧 进行中（2026-11-10 job 引擎 + Jobs 页已联调通过）
+   - 新 `src/rclone/nemo-rclone-job.[ch]`、`nemo-rclone-job-manager.[ch]`。
+   - 多 job 并行，互不覆盖；每个 job 独立进度/日志/取消（已实现）。
+   - **Jobs 页已上线**：Transfer 窗口改用 Notebook，新增 “Jobs” 标签页；
+     `on_start_clicked` 起 job 后自动切到 Jobs 页；取消按选中 job 操作；
+     顶部汇总（运行数 / 总速度）；Clear finished 清已完成；每秒 `jobs_tick` 就地刷新
+     进度/速度字符串、不重排列表、不打扰选中项；关窗时若仍有 running job 拦截（`on_delete_event`）。
+   - 修掉旧内联单进程代码（`finish_job`/`job_read_line`/`job_wait_cb` 等死代码）与 `-Werror` 告警；
+     修复本仓库非标准 GTK3 API 适配（`gtk_notebook_get_n_pages`、
+     `gtk_tree_selection_get_selected(&model, …)`、`gtk_text_buffer_set_text(…, -1)`、
+     移除错误的 `gtk_tree_view_set_attributes`、新增 `nemo-progress-info.h` 包含）。
+   - 待办：`nemo-rclone-rc.[ch]` 轮询、`GNotification`、侧边栏计数、CSS 美化（≤4Hz 平滑）。
 - **P2 RC 统计 / FUSE 上传可见**
   - mount argv 加 `--rc` socket；JobManager 轮询 `vfs/queue`、`vfs/stats`。
   - copy 进挂载点后，Nemo 进度到 100% 时 Jobs 页继续显示 “Uploading to <remote>” 直到 queue 清空。

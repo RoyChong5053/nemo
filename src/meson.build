@@ -59,6 +59,8 @@ nemoCommon_sources = [
   'nemo-progress-ui-handler.c',
   'nemo-properties-window.c',
   'nemo-query-editor.c',
+  'rclone/nemo-rclone-job-manager.c',
+  'rclone/nemo-rclone-job.c',
   'rclone/nemo-rclone-path.c',
   'rclone/nemo-rclone-service.c',
   'rclone/nemo-rclone-window.c',

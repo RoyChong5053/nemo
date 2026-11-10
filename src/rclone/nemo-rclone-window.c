@@ -13,6 +13,8 @@
 #include "nemo-rclone-window.h"
 #include "nemo-rclone-path.h"
 #include "nemo-rclone-service.h"
+#include "nemo-rclone-job-manager.h"
+#include <libnemo-private/nemo-progress-info.h>
 #include "nemo-window.h"
 #include "nemo-window-slot.h"
 
@@ -53,244 +55,32 @@ typedef struct {
 	gboolean wait_done;
 
 	guint status_timer;
+
+	GtkWidget *notebook;
+	guint jobs_tab_index;
+	GtkWidget *jobs_summary;
+
+	NemoRcloneJobManager *job_manager;
+
+	GtkWidget *jobs_view;
+	GtkListStore *jobs_store;
+	GtkWidget *jobs_detail_view;
+	GtkTextBuffer *jobs_detail_buffer;
+	GtkWidget *jobs_description;
+	GtkWidget *jobs_state;
+	GtkWidget *jobs_progress;
+	GtkWidget *jobs_speed;
+	guint jobs_selected;
+	guint jobs_timer;
 } RcloneWindow;
 
 static RcloneWindow *rclone_window = NULL;
 
-static void
-append_log (GtkTextBuffer *buffer,
-            const char *text)
-{
-	GtkTextIter end;
-
-	if (buffer == NULL || text == NULL) {
-		return;
-	}
-
-	gtk_text_buffer_get_end_iter (buffer, &end);
-	gtk_text_buffer_insert (buffer, &end, text, -1);
-	gtk_text_buffer_insert (buffer, &end, "\n", -1);
-
-	/* Keep the log bounded. */
-	if (gtk_text_buffer_get_line_count (buffer) > 400) {
-		GtkTextIter start;
-		GtkTextIter cut;
-
-		gtk_text_buffer_get_start_iter (buffer, &start);
-		cut = start;
-		gtk_text_iter_forward_lines (&cut, 100);
-		gtk_text_buffer_delete (buffer, &start, &cut);
-	}
-}
-
-static gint64
-json_int_member (JsonObject *object,
-                 const char *member)
-{
-	JsonNode *node;
-
-	if (!json_object_has_member (object, member)) {
-		return 0;
-	}
-
-	node = json_object_get_member (object, member);
-	if (node == NULL || !JSON_NODE_HOLDS_VALUE (node)) {
-		return 0;
-	}
-
-	if (json_node_get_value_type (node) == G_TYPE_DOUBLE) {
-		return (gint64) json_node_get_double (node);
-	}
-
-	return json_node_get_int (node);
-}
-
-static double
-json_double_member (JsonObject *object,
-                    const char *member)
-{
-	JsonNode *node;
-
-	if (!json_object_has_member (object, member)) {
-		return 0.0;
-	}
-
-	node = json_object_get_member (object, member);
-	if (node == NULL || !JSON_NODE_HOLDS_VALUE (node)) {
-		return 0.0;
-	}
-
-	if (json_node_get_value_type (node) == G_TYPE_INT64) {
-		return (double) json_node_get_int (node);
-	}
-
-	return json_node_get_double (node);
-}
-
-static void
-handle_json_line (RcloneWindow *self,
-                  const char *line)
-{
-	JsonParser *parser;
-	JsonNode *root;
-	JsonObject *object;
-
-	parser = json_parser_new ();
-
-	if (!json_parser_load_from_data (parser, line, -1, NULL)) {
-		g_object_unref (parser);
-		return;
-	}
-
-	root = json_parser_get_root (parser);
-
-	if (!JSON_NODE_HOLDS_OBJECT (root)) {
-		g_object_unref (parser);
-		return;
-	}
-
-	object = json_node_get_object (root);
-
-	if (json_object_has_member (object, "stats")) {
-		JsonObject *stats = json_object_get_object_member (object, "stats");
-		gint64 bytes = json_int_member (stats, "bytes");
-		gint64 total = json_int_member (stats, "totalBytes");
-		double speed = json_double_member (stats, "speed");
-		gint64 eta = json_int_member (stats, "eta");
-		char *done = g_format_size ((guint64) bytes);
-		char *all = g_format_size ((guint64) total);
-		char *rate = g_format_size ((guint64) speed);
-		char *status;
-
-		if (total > 0) {
-			gtk_progress_bar_set_fraction (GTK_PROGRESS_BAR (self->job_progress),
-			                               (double) bytes / (double) total);
-		} else {
-			gtk_progress_bar_pulse (GTK_PROGRESS_BAR (self->job_progress));
-		}
-
-		if (eta > 0) {
-			status = g_strdup_printf (_("Transferred %s / %s (%s/s, ETA %" G_GINT64_FORMAT "s)"),
-			                          done, all, rate, eta);
-		} else {
-			status = g_strdup_printf (_("Transferred %s / %s (%s/s)"),
-			                          done, all, rate);
-		}
-
-		gtk_label_set_text (GTK_LABEL (self->job_status), status);
-
-		g_free (status);
-		g_free (done);
-		g_free (all);
-		g_free (rate);
-	} else if (json_object_has_member (object, "msg")) {
-		const char *msg = json_object_get_string_member (object, "msg");
-		const char *level = json_object_has_member (object, "level") ?
-		                    json_object_get_string_member (object, "level") : "info";
-
-		if (g_strcmp0 (level, "debug") != 0) {
-			append_log (self->job_log, msg);
-		}
-	}
-
-	g_object_unref (parser);
-}
-
-static void
-finish_job (RcloneWindow *self)
-{
-	self->running = FALSE;
-
-	gtk_widget_set_sensitive (self->start_button, TRUE);
-	gtk_widget_set_sensitive (self->cancel_button, FALSE);
-
-	g_clear_object (&self->stream);
-	g_clear_object (&self->process);
-}
-
-static void
-job_read_line (RcloneWindow *self);
-
-static void
-job_read_line_cb (GObject *source_object,
-                  GAsyncResult *result,
-                  gpointer user_data)
-{
-	RcloneWindow *self = user_data;
-	GError *error = NULL;
-	char *line;
-
-	line = g_data_input_stream_read_line_finish (G_DATA_INPUT_STREAM (source_object),
-	                                             result, NULL, &error);
-
-	if (line != NULL) {
-		handle_json_line (self, line);
-		g_free (line);
-		job_read_line (self);
-		return;
-	}
-
-	if (error != NULL) {
-		g_error_free (error);
-	}
-
-	self->read_done = TRUE;
-
-	if (self->wait_done && self->process != NULL) {
-		finish_job (self);
-	}
-}
-
-static void
-job_read_line (RcloneWindow *self)
-{
-	if (self->stream == NULL) {
-		self->read_done = TRUE;
-		return;
-	}
-
-	g_data_input_stream_read_line_async (self->stream,
-	                                     G_PRIORITY_DEFAULT,
-	                                     NULL,
-	                                     job_read_line_cb,
-	                                     self);
-}
-
-static void
-job_wait_cb (GObject *source_object,
-             GAsyncResult *result,
-             gpointer user_data)
-{
-	RcloneWindow *self = user_data;
-	GError *error = NULL;
-	gboolean success;
-
-	success = g_subprocess_wait_check_finish (G_SUBPROCESS (source_object),
-	                                          result, &error);
-
-	if (success) {
-		gtk_progress_bar_set_fraction (GTK_PROGRESS_BAR (self->job_progress), 1.0);
-		gtk_label_set_text (GTK_LABEL (self->job_status), _("Transfer finished."));
-		append_log (self->job_log, _("Transfer finished."));
-	} else {
-		if (error != NULL) {
-			char *msg = g_strdup_printf (_("Transfer failed: %s"), error->message);
-			gtk_label_set_text (GTK_LABEL (self->job_status), msg);
-			append_log (self->job_log, msg);
-			g_free (msg);
-			g_error_free (error);
-		} else {
-			gtk_label_set_text (GTK_LABEL (self->job_status), _("Transfer cancelled."));
-			append_log (self->job_log, _("Transfer cancelled."));
-		}
-	}
-
-	self->wait_done = TRUE;
-
-	if (self->read_done && self->process != NULL) {
-		finish_job (self);
-	}
-}
+/* Kinds of rows in the Jobs list. */
+enum {
+	JOB_KIND_RCLONE,  /* a rclone transfer (cancellable via the job API) */
+	JOB_KIND_NEMO     /* a Nemo file operation (local / mount copy) */
+};
 
 static char *
 combo_active_text (GtkWidget *combo)
@@ -345,6 +135,383 @@ set_combo_active_text (GtkWidget *combo,
 }
 
 static void
+jobs_refresh (RcloneWindow *self,
+              const char *select_id);
+
+/* ------------------------------ Jobs page ------------------------------ */
+/*  0: G_TYPE_STRING   row id ("r:<uuid>" or "n:<n>")
+    1: G_TYPE_STRING   state label
+    2: G_TYPE_STRING   formatted progress ("45%")
+    3: G_TYPE_STRING   formatted speed ("1.2 MB/s")
+    4: G_TYPE_STRING   "source → destination" description
+    5: G_TYPE_BOOLEAN  whether this is a rclone job (else a Nemo op)
+    6: G_TYPE_POINTER  rclone job pointer (NULL for Nemo ops)
+    7: G_TYPE_POINTER  NemoProgressInfo pointer (NULL for rclone jobs)
+*/
+static void
+jobs_refresh (RcloneWindow *self,
+              const char *select_id)
+{
+	NemoRcloneJobManager *manager;
+	GtkListStore *store;
+	GtkTreeIter iter;
+	guint selected_row = 0;
+	gboolean did_select = FALSE;
+	GList *l;
+	guint row = 0;
+	guint nemo_counter = 0;
+
+	manager = self->job_manager;
+	store = self->jobs_store;
+
+	if (store == NULL) {
+		return;
+	}
+
+	gtk_list_store_clear (store);
+
+	/* rclone jobs, newest first (get_jobs already returns newest first). */
+	if (manager != NULL) {
+		GPtrArray *jobs = nemo_rclone_job_manager_get_jobs (manager);
+		guint i;
+
+		for (i = jobs->len; i-- > 0; ) {
+			NemoRcloneJob *job = g_ptr_array_index (jobs, i);
+			const char *src = nemo_rclone_job_get_src (job);
+			const char *dst = nemo_rclone_job_get_dst (job);
+			double frac = nemo_rclone_job_get_fraction (job);
+			double speed = nemo_rclone_job_get_speed (job);
+			const char *state = nemo_rclone_job_get_state_label (job);
+			char *desc = NULL;
+			char *progress = NULL;
+			char *spd = NULL;
+
+			if (src != NULL && dst != NULL) {
+				desc = g_strdup_printf ("%s → %s", src, dst);
+			} else {
+				desc = g_strdup (job != NULL ? nemo_rclone_job_get_id (job) : "?");
+			}
+
+			if (frac >= 0.0) {
+				progress = g_strdup_printf ("%ld%%",
+				                           (long) (frac * 100.0 + 0.5));
+			} else {
+				progress = g_strdup ("…");
+			}
+
+			if (speed > 0) {
+				spd = g_strdup_printf ("%s/s", g_format_size ((guint64) speed));
+			}
+
+			gtk_list_store_append (store, &iter);
+			gtk_list_store_set (store, &iter,
+			                    0, nemo_rclone_job_get_id (job),
+			                    1, state != NULL ? state : "…",
+			                    2, progress,
+			                    3, spd != NULL ? spd : "",
+			                    4, desc,
+			                    5, TRUE,
+			                    6, job,
+			                    7, NULL,
+			                    -1);
+			g_free (desc);
+			g_free (progress);
+			g_free (spd);
+
+			if (select_id != NULL &&
+			    g_strcmp0 (nemo_rclone_job_get_id (job), select_id) == 0) {
+				selected_row = row;
+				did_select = TRUE;
+			}
+			row++;
+		}
+	}
+
+	/* Nemo's own file operations (local / FUSE copies), so the Jobs page
+	   shows them alongside rclone jobs. */
+	for (l = nemo_rclone_job_manager_get_nemo_infos (manager); l != NULL; l = l->next) {
+		NemoProgressInfo *info = NEMO_PROGRESS_INFO (l->data);
+		double progress = nemo_progress_info_get_progress (info);
+		char *state = nemo_progress_info_get_status (info);
+		char *desc = NULL;
+		char *progress_txt = NULL;
+		char *spd = NULL;
+
+		if (progress < 0) {
+			progress = 0.0;
+		}
+
+		desc = g_strdup_printf (_("File operation: %s"),
+		                        state != NULL ? state : _("running"));
+
+		if (progress >= 1.0) {
+			progress_txt = g_strdup (_("Done"));
+		} else {
+			progress_txt = g_strdup_printf ("%ld%%",
+			                               (long) (progress * 100.0 + 0.5));
+		}
+
+		gtk_list_store_append (store, &iter);
+		gtk_list_store_set (store, &iter,
+		                    0, g_strdup_printf ("n:%u", nemo_counter++),
+		                    1, state != NULL ? state : _("running"),
+		                    2, progress_txt,
+		                    3, spd != NULL ? spd : "",
+		                    4, desc,
+		                    5, FALSE,
+		                    6, NULL,
+		                    7, info,
+		                    -1);
+		g_free (state);
+		g_free (desc);
+		g_free (progress_txt);
+		g_free (spd);
+		row++;
+	}
+
+	/* Select the row we were told to, or fall back to the first row. */
+	if (did_select) {
+		GtkTreeIter sel_iter;
+		GtkTreeSelection *sel = gtk_tree_view_get_selection (
+			GTK_TREE_VIEW (self->jobs_view));
+
+		gtk_tree_model_iter_nth_child (GTK_TREE_MODEL (store), &sel_iter,
+		                               NULL, selected_row);
+		gtk_tree_selection_select_iter (sel, &sel_iter);
+		{
+			char *idx = g_strdup_printf ("%u", selected_row);
+			GtkTreePath *path = gtk_tree_path_new_from_string (idx);
+
+			gtk_tree_view_scroll_to_cell (GTK_TREE_VIEW (self->jobs_view),
+			                              path, NULL, FALSE, 0.5, 0.0);
+			gtk_tree_path_free (path);
+			g_free (idx);
+		}
+	} else {
+		GtkTreeIter first;
+
+		if (gtk_tree_model_get_iter_first (GTK_TREE_MODEL (store), &first)) {
+			GtkTreeSelection *sel = gtk_tree_view_get_selection (
+				GTK_TREE_VIEW (self->jobs_view));
+			gtk_tree_selection_select_iter (sel, &first);
+		}
+	}
+}
+
+/* Live-update progress / speed of rows without rebuilding the store, so we
+   don't disturb the current selection or scroll position every tick. */
+static void
+jobs_update_live (RcloneWindow *self)
+{
+	GtkTreeModel *model = GTK_TREE_MODEL (self->jobs_store);
+	GtkTreeIter iter;
+
+	if (self->jobs_store == NULL) {
+		return;
+	}
+
+	while (gtk_tree_model_iter_next (model, &iter)) {
+		guint kind;
+		gpointer job, info;
+		char *progress = NULL;
+		char *spd = NULL;
+
+		gtk_tree_model_get (model, &iter, 5, &kind, 6, &job, 7, &info, -1);
+
+		if (kind == JOB_KIND_RCLONE && job != NULL) {
+			NemoRcloneJob *rjob = NEMO_RCLONE_JOB (job);
+			double frac = nemo_rclone_job_get_fraction (rjob);
+			double speed = nemo_rclone_job_get_speed (rjob);
+
+			if (frac >= 0.0) {
+				progress = g_strdup_printf ("%ld%%", (long) (frac * 100.0 + 0.5));
+			} else {
+				progress = g_strdup ("…");
+			}
+			if (speed > 0) {
+				spd = g_strdup_printf ("%s/s", g_format_size ((guint64) speed));
+			}
+			gtk_list_store_set (self->jobs_store, &iter, 2, progress, 3, spd, -1);
+		} else if (kind == JOB_KIND_NEMO && info != NULL) {
+			double p = nemo_progress_info_get_progress (NEMO_PROGRESS_INFO (info));
+
+			if (p >= 1.0) {
+				progress = g_strdup (_("Done"));
+			} else {
+				progress = g_strdup_printf ("%ld%%", (long) (p * 100.0 + 0.5));
+			}
+			gtk_list_store_set (self->jobs_store, &iter, 2, progress, -1);
+		}
+
+		g_free (progress);
+		g_free (spd);
+	}
+}
+
+static gboolean
+jobs_live_tick (gpointer user_data)
+{
+	RcloneWindow *self = user_data;
+
+	jobs_update_live (self);
+
+	return G_SOURCE_CONTINUE;
+}
+
+static void
+jobs_update_detail (RcloneWindow *self,
+                    gpointer user_data)
+{
+	GtkTreeModel *model = GTK_TREE_MODEL (self->jobs_store);
+	GtkTreeIter iter;
+	gboolean found;
+	guint kind;
+	gpointer job;
+	gpointer info;
+
+	GtkTreeSelection *sel = gtk_tree_view_get_selection (
+		GTK_TREE_VIEW (self->jobs_view));
+	found = gtk_tree_selection_get_selected (sel, &model, &iter);
+
+	if (!found) {
+		if (self->jobs_detail_buffer != NULL) {
+			gtk_text_buffer_set_text (self->jobs_detail_buffer, "", -1);
+		}
+		if (self->jobs_state != NULL) {
+			gtk_label_set_text (GTK_LABEL (self->jobs_state), "");
+		}
+		if (self->jobs_description != NULL) {
+			gtk_label_set_text (GTK_LABEL (self->jobs_description), "");
+		}
+		return;
+	}
+
+	gtk_tree_model_get (model, &iter,
+	                    5, &kind,
+	                    6, &job,
+	                    7, &info,
+	                    -1);
+
+	if (kind == JOB_KIND_RCLONE && job != NULL) {
+		NemoRcloneJob *rjob = NEMO_RCLONE_JOB (job);
+
+		if (self->jobs_description != NULL) {
+			gtk_label_set_text (GTK_LABEL (self->jobs_description),
+			                    nemo_rclone_job_get_status_text (rjob) != NULL ?
+			                    nemo_rclone_job_get_status_text (rjob) : "");
+		}
+		if (self->jobs_state != NULL) {
+			gtk_label_set_text (GTK_LABEL (self->jobs_state),
+			                    nemo_rclone_job_get_state_label (rjob));
+		}
+		if (self->jobs_progress != NULL) {
+			double frac = nemo_rclone_job_get_fraction (rjob);
+			if (frac >= 0.0) {
+				gtk_progress_bar_set_fraction (GTK_PROGRESS_BAR (self->jobs_progress), frac);
+			} else {
+				gtk_progress_bar_pulse (GTK_PROGRESS_BAR (self->jobs_progress));
+			}
+		}
+		if (self->jobs_detail_buffer != NULL) {
+			const char *log = nemo_rclone_job_get_log (rjob);
+			gtk_text_buffer_set_text (self->jobs_detail_buffer,
+			                          log != NULL ? log : "", -1);
+		}
+	} else if (kind == JOB_KIND_NEMO && info != NULL) {
+		NemoProgressInfo *ninfo = NEMO_PROGRESS_INFO (info);
+		char *details = nemo_progress_info_get_details (ninfo);
+
+		if (self->jobs_description != NULL) {
+			gtk_label_set_text (GTK_LABEL (self->jobs_description),
+			                    details != NULL ? details : "");
+		}
+		if (self->jobs_state != NULL) {
+			gtk_label_set_text (GTK_LABEL (self->jobs_state),
+			                    nemo_progress_info_get_status (ninfo) != NULL ?
+			                    nemo_progress_info_get_status (ninfo) : "");
+		}
+		if (self->jobs_progress != NULL) {
+			double frac = nemo_progress_info_get_progress (ninfo);
+			if (frac >= 0.0) {
+				gtk_progress_bar_set_fraction (GTK_PROGRESS_BAR (self->jobs_progress), frac);
+			} else {
+				gtk_progress_bar_pulse (GTK_PROGRESS_BAR (self->jobs_progress));
+			}
+		}
+		if (self->jobs_detail_buffer != NULL) {
+			gtk_text_buffer_set_text (self->jobs_detail_buffer,
+			                          details != NULL ? details : "", -1);
+		}
+		g_free (details);
+	}
+
+	if (self->jobs_summary != NULL) {
+		double speed = nemo_rclone_job_manager_total_speed (self->job_manager);
+		guint running = nemo_rclone_job_manager_count_running (self->job_manager);
+
+		gtk_label_set_markup (GTK_LABEL (self->jobs_summary),
+		                      g_strdup_printf (
+			                      "<b>%d running</b> · <b>%s/s</b>",
+			                      running, g_format_size ((guint64) speed)));
+	}
+}
+
+static void
+on_jobs_clear_clicked (GtkButton *button,
+                       gpointer user_data)
+{
+	RcloneWindow *self = user_data;
+
+	(void) button;
+
+	if (self->job_manager != NULL) {
+		nemo_rclone_job_manager_clear_finished (self->job_manager);
+	}
+
+	if (self->jobs_view != NULL) {
+		GtkTreeSelection *sel = gtk_tree_view_get_selection (
+			GTK_TREE_VIEW (self->jobs_view));
+		gtk_tree_selection_select_range (sel,
+		                                 gtk_tree_path_new_from_string ("0"),
+			                                 NULL);
+	}
+}
+
+static void
+on_jobs_cancel_clicked (GtkButton *button,
+                        gpointer user_data)
+{
+	RcloneWindow *self = user_data;
+	GtkTreeModel *model = GTK_TREE_MODEL (self->jobs_store);
+	GtkTreeIter iter;
+	gboolean found;
+	guint kind;
+	gpointer job;
+	gpointer info;
+
+	(void) button;
+
+	GtkTreeSelection *sel = gtk_tree_view_get_selection (
+		GTK_TREE_VIEW (self->jobs_view));
+	found = gtk_tree_selection_get_selected (sel, &model, &iter);
+	if (!found) {
+		return;
+	}
+
+	gtk_tree_model_get (model, &iter,
+	                    5, &kind,
+	                    6, &job,
+	                    7, &info,
+	                    -1);
+
+	if (kind == JOB_KIND_RCLONE && job != NULL) {
+		nemo_rclone_job_cancel (NEMO_RCLONE_JOB (job));
+	} else if (kind == JOB_KIND_NEMO && info != NULL) {
+		nemo_progress_info_cancel (NEMO_PROGRESS_INFO (info));
+	}
+}
+
+static void
 on_start_clicked (GtkButton *button,
                   gpointer user_data)
 {
@@ -356,14 +523,15 @@ on_start_clicked (GtkButton *button,
 	char *src = NULL;
 	char *dst = NULL;
 	char *mode;
-	GPtrArray *args;
-	GSubprocessLauncher *launcher;
+	NemoRcloneJob *job;
+	NemoRcloneJobManager *manager;
+	gboolean dry_run;
 	GError *error = NULL;
 
 	(void) button;
 
 	if (remote_a == NULL || remote_b == NULL) {
-		gtk_label_set_text (GTK_LABEL (self->job_status),
+		gtk_label_set_text (GTK_LABEL (self->status_label),
 		                    _("Choose a source and a destination first."));
 		g_free (remote_a);
 		g_free (remote_b);
@@ -378,76 +546,38 @@ on_start_clicked (GtkButton *button,
 		mode = g_strdup ("copy");
 	}
 
-	args = g_ptr_array_new_with_free_func (g_free);
-	g_ptr_array_add (args, g_strdup ("rclone"));
-	g_ptr_array_add (args, g_strdup (mode));
-	g_ptr_array_add (args, g_strdup (src));
-	g_ptr_array_add (args, g_strdup (dst));
-	g_ptr_array_add (args, g_strdup ("--use-json-log"));
-	g_ptr_array_add (args, g_strdup ("--stats"));
-	g_ptr_array_add (args, g_strdup ("1s"));
-	g_ptr_array_add (args, g_strdup ("--log-level"));
-	g_ptr_array_add (args, g_strdup ("INFO"));
-	g_ptr_array_add (args, g_strdup ("--transfers"));
-	g_ptr_array_add (args, g_strdup ("4"));
-	g_ptr_array_add (args, g_strdup ("--checkers"));
-	g_ptr_array_add (args, g_strdup ("8"));
-	g_ptr_array_add (args, g_strdup ("--ignore-checksum"));
+	dry_run = gtk_toggle_button_get_active (GTK_TOGGLE_BUTTON (self->dry_run_check));
 
-	if (gtk_toggle_button_get_active (GTK_TOGGLE_BUTTON (self->dry_run_check))) {
-		g_ptr_array_add (args, g_strdup ("--dry-run"));
-	}
+	manager = nemo_rclone_job_manager_get_default ();
+	job = nemo_rclone_job_manager_start_job (manager, mode, src, dst,
+	                                         dry_run, &error);
 
-	g_ptr_array_add (args, NULL);
+	if (job == NULL) {
+		char *msg;
 
-	gtk_text_buffer_set_text (self->job_log, "", -1);
-	gtk_progress_bar_set_fraction (GTK_PROGRESS_BAR (self->job_progress), 0.0);
-	gtk_label_set_text (GTK_LABEL (self->job_status), _("Starting…"));
-	gtk_widget_set_sensitive (self->start_button, FALSE);
-	gtk_widget_set_sensitive (self->cancel_button, TRUE);
-
-	launcher = g_subprocess_launcher_new (G_SUBPROCESS_FLAGS_STDOUT_PIPE |
-	                                      G_SUBPROCESS_FLAGS_STDERR_MERGE);
-
-	self->process = g_subprocess_launcher_spawnv (launcher,
-	                                              (const char *const *) args->pdata,
-	                                              &error);
-
-	g_object_unref (launcher);
-	g_ptr_array_free (args, TRUE);
-
-	if (self->process == NULL) {
-		char *msg = g_strdup_printf (_("Unable to start rclone: %s"),
-		                             error != NULL ? error->message : _("unknown error"));
-
-		gtk_label_set_text (GTK_LABEL (self->job_status), msg);
-		append_log (self->job_log, msg);
-		g_free (msg);
 		if (error != NULL) {
+			msg = g_strdup_printf (_("Unable to start transfer: %s"),
+			                       error->message);
 			g_error_free (error);
+		} else {
+			msg = g_strdup_printf (_("Unable to start %s"), mode);
 		}
-		gtk_widget_set_sensitive (self->start_button, TRUE);
-		gtk_widget_set_sensitive (self->cancel_button, FALSE);
-		g_free (remote_a);
-		g_free (remote_b);
-		g_free (src);
-		g_free (dst);
-		g_free (mode);
-		return;
+
+		gtk_label_set_text (GTK_LABEL (self->status_label), msg);
+		g_free (msg);
+	} else {
+		char *msg = g_strdup_printf (_("Started %s to %s"), src, dst);
+		gtk_label_set_text (GTK_LABEL (self->status_label), msg);
+		g_free (msg);
+
+		/* Switch to the Jobs page so the new job is visible. */
+		if (self->notebook != NULL) {
+			gtk_notebook_set_current_page (GTK_NOTEBOOK (self->notebook),
+			                               self->jobs_tab_index);
+		}
+
+		jobs_refresh (self, nemo_rclone_job_get_id (job));
 	}
-
-	self->stream = g_data_input_stream_new (g_subprocess_get_stdout_pipe (self->process));
-	g_data_input_stream_set_newline_type (self->stream, G_DATA_STREAM_NEWLINE_TYPE_ANY);
-
-	self->running = TRUE;
-	self->read_done = FALSE;
-	self->wait_done = FALSE;
-
-	g_subprocess_wait_check_async (self->process, NULL, job_wait_cb, self);
-	job_read_line (self);
-
-	append_log (self->job_log, src);
-	append_log (self->job_log, dst);
 
 	g_free (remote_a);
 	g_free (remote_b);
@@ -464,9 +594,12 @@ on_cancel_clicked (GtkButton *button,
 
 	(void) button;
 
-	if (self->process != NULL) {
-		g_subprocess_force_exit (self->process);
-		gtk_label_set_text (GTK_LABEL (self->job_status), _("Cancelling…"));
+	/* Cancel whatever is selected on the Jobs page (rclone job or Nemo
+	   file operation).  Does nothing if the list is empty. */
+	on_jobs_cancel_clicked (NULL, self);
+
+	if (self->jobs_view != NULL) {
+		jobs_refresh (self, NULL);
 	}
 }
 
@@ -1408,7 +1541,8 @@ on_delete_event (GtkWidget *widget,
 	(void) widget;
 	(void) event;
 
-	if (self->running) {
+	if (self->job_manager != NULL &&
+	    nemo_rclone_job_manager_count_running (self->job_manager) > 0) {
 		GtkWidget *dialog = gtk_message_dialog_new (
 			GTK_WINDOW (self->window), GTK_DIALOG_MODAL,
 			GTK_MESSAGE_WARNING, GTK_BUTTONS_CLOSE,
@@ -1644,6 +1778,15 @@ on_window_destroy (GtkWidget *widget,
 		self->status_timer = 0;
 	}
 
+	if (self->jobs_timer != 0) {
+		g_source_remove (self->jobs_timer);
+		self->jobs_timer = 0;
+	}
+
+	if (self->job_manager != NULL) {
+		g_clear_object (&self->job_manager);
+	}
+
 	if (rclone_window == self) {
 		rclone_window = NULL;
 	}
@@ -1663,6 +1806,150 @@ favorites_status_tick (gpointer user_data)
 	return G_SOURCE_CONTINUE;
 }
 
+static GtkWidget *
+build_jobs_tab (RcloneWindow *self)
+{
+	GtkWidget *vbox;
+	GtkWidget *scroll;
+	GtkWidget *buttons;
+	GtkWidget *cancel_button;
+	GtkWidget *clear_button;
+	GtkWidget *detail_scroll;
+	GtkCellRenderer *renderer;
+	GtkTreeViewColumn *column;
+
+	self->job_manager = nemo_rclone_job_manager_get_default ();
+	self->jobs_store = gtk_list_store_new (8,
+	                                       G_TYPE_STRING,
+	                                       G_TYPE_STRING,
+	                                       G_TYPE_STRING,
+	                                       G_TYPE_STRING,
+	                                       G_TYPE_STRING,
+	                                       G_TYPE_BOOLEAN,
+	                                       G_TYPE_POINTER,
+	                                       G_TYPE_POINTER);
+
+	self->jobs_view = gtk_tree_view_new_with_model (
+		GTK_TREE_MODEL (self->jobs_store));
+	gtk_tree_view_set_headers_visible (GTK_TREE_VIEW (self->jobs_view), TRUE);
+	gtk_tree_view_set_enable_search (GTK_TREE_VIEW (self->jobs_view), FALSE);
+
+	/* State */
+	renderer = gtk_cell_renderer_text_new ();
+	column = gtk_tree_view_column_new_with_attributes (_("State"), renderer,
+	                                                   "text", 1, NULL);
+	gtk_tree_view_append_column (GTK_TREE_VIEW (self->jobs_view), column);
+
+	/* Progress as a percentage */
+	renderer = gtk_cell_renderer_text_new ();
+	column = gtk_tree_view_column_new_with_attributes (_("Progress"), renderer,
+	                                                   "text", 2, NULL);
+	gtk_tree_view_append_column (GTK_TREE_VIEW (self->jobs_view), column);
+
+	/* Speed */
+	renderer = gtk_cell_renderer_text_new ();
+	column = gtk_tree_view_column_new_with_attributes (_("Speed"), renderer,
+	                                                   "text", 3, NULL);
+	gtk_tree_view_append_column (GTK_TREE_VIEW (self->jobs_view), column);
+
+	/* Description */
+	renderer = gtk_cell_renderer_text_new ();
+	column = gtk_tree_view_column_new_with_attributes (_("Job"), renderer,
+	                                                   "text", 4, NULL);
+	gtk_tree_view_column_set_expand (column, TRUE);
+	gtk_tree_view_append_column (GTK_TREE_VIEW (self->jobs_view), column);
+
+	g_signal_connect (GTK_TREE_VIEW (self->jobs_view), "selection-changed",
+	                  G_CALLBACK (jobs_update_detail), self);
+
+	scroll = gtk_scrolled_window_new (NULL, NULL);
+	gtk_scrolled_window_set_shadow_type (GTK_SCROLLED_WINDOW (scroll), GTK_SHADOW_IN);
+	gtk_container_add (GTK_CONTAINER (scroll), self->jobs_view);
+	gtk_scrolled_window_set_policy (GTK_SCROLLED_WINDOW (scroll),
+	                                GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
+
+	self->jobs_summary = gtk_label_new (_("No transfers."));
+	gtk_label_set_xalign (GTK_LABEL (self->jobs_summary), 0.0);
+
+	/* Detail area */
+	self->jobs_description = gtk_label_new (NULL);
+	gtk_label_set_xalign (GTK_LABEL (self->jobs_description), 0.0);
+	gtk_label_set_line_wrap (GTK_LABEL (self->jobs_description), TRUE);
+	gtk_label_set_ellipsize (GTK_LABEL (self->jobs_description), PANGO_ELLIPSIZE_END);
+	gtk_label_set_markup (GTK_LABEL (self->jobs_description),
+	                      "<b></b>");
+
+	self->jobs_progress = gtk_progress_bar_new ();
+	gtk_progress_bar_set_show_text (GTK_PROGRESS_BAR (self->jobs_progress), FALSE);
+
+	self->jobs_state = gtk_label_new (NULL);
+	gtk_label_set_xalign (GTK_LABEL (self->jobs_state), 0.0);
+
+	detail_scroll = gtk_scrolled_window_new (NULL, NULL);
+	gtk_scrolled_window_set_shadow_type (GTK_SCROLLED_WINDOW (detail_scroll), GTK_SHADOW_IN);
+	self->jobs_detail_view = gtk_text_view_new ();
+	gtk_text_view_set_editable (GTK_TEXT_VIEW (self->jobs_detail_view), FALSE);
+	gtk_text_view_set_monospace (GTK_TEXT_VIEW (self->jobs_detail_view), TRUE);
+	gtk_text_view_set_wrap_mode (GTK_TEXT_VIEW (self->jobs_detail_view), GTK_WRAP_WORD_CHAR);
+	self->jobs_detail_buffer = gtk_text_view_get_buffer (GTK_TEXT_VIEW (self->jobs_detail_view));
+	gtk_container_add (GTK_CONTAINER (detail_scroll), self->jobs_detail_view);
+	gtk_scrolled_window_set_policy (GTK_SCROLLED_WINDOW (detail_scroll),
+	                                GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
+
+	vbox = gtk_box_new (GTK_ORIENTATION_VERTICAL, 6);
+	gtk_container_set_border_width (GTK_CONTAINER (vbox), 10);
+
+	gtk_box_pack_start (GTK_BOX (vbox), self->jobs_summary, FALSE, FALSE, 0);
+	gtk_box_pack_start (GTK_BOX (vbox), scroll, TRUE, TRUE, 0);
+
+	/* Separator between list and detail */
+	gtk_box_pack_start (GTK_BOX (vbox), gtk_separator_new (GTK_ORIENTATION_HORIZONTAL),
+	                    FALSE, FALSE, 2);
+
+	{
+		GtkWidget *detail_grid;
+		GtkWidget *plabel;
+
+		detail_grid = gtk_grid_new ();
+		gtk_grid_set_row_spacing (GTK_GRID (detail_grid), 4);
+		gtk_grid_set_column_spacing (GTK_GRID (detail_grid), 6);
+		gtk_widget_set_margin_start (detail_grid, 0);
+		gtk_widget_set_margin_end (detail_grid, 0);
+
+		plabel = gtk_label_new (_("Details:"));
+		gtk_label_set_markup (GTK_LABEL (plabel), "<b>Details</b>");
+		gtk_grid_attach (GTK_GRID (detail_grid), plabel, 0, 0, 1, 1);
+
+		gtk_grid_attach (GTK_GRID (detail_grid), self->jobs_description, 0, 1, 1, 1);
+		gtk_grid_attach (GTK_GRID (detail_grid), self->jobs_progress, 0, 2, 1, 1);
+		gtk_grid_attach (GTK_GRID (detail_grid), self->jobs_state, 0, 3, 1, 1);
+		gtk_grid_attach (GTK_GRID (detail_grid), detail_scroll, 0, 4, 1, 3);
+
+		gtk_box_pack_start (GTK_BOX (vbox), detail_grid, TRUE, TRUE, 0);
+	}
+
+	buttons = gtk_button_box_new (GTK_ORIENTATION_HORIZONTAL);
+	gtk_button_box_set_layout (GTK_BUTTON_BOX (buttons), GTK_BUTTONBOX_START);
+	gtk_box_pack_start (GTK_BOX (vbox), buttons, FALSE, FALSE, 0);
+
+	cancel_button = gtk_button_new_with_label (_("Cancel"));
+	gtk_container_add (GTK_CONTAINER (buttons), cancel_button);
+
+	clear_button = gtk_button_new_with_label (_("Clear finished"));
+	gtk_container_add (GTK_CONTAINER (buttons), clear_button);
+
+	g_signal_connect (cancel_button, "clicked",
+	                  G_CALLBACK (on_jobs_cancel_clicked), self);
+	g_signal_connect (clear_button, "clicked",
+	                  G_CALLBACK (on_jobs_clear_clicked), self);
+
+	jobs_refresh (self, NULL);
+
+	self->jobs_timer = g_timeout_add_seconds (1, jobs_live_tick, self);
+
+	return vbox;
+}
+
 static RcloneWindow *
 rclone_window_new (GtkWindow *parent)
 {
@@ -1670,6 +1957,7 @@ rclone_window_new (GtkWindow *parent)
 	GtkWidget *notebook;
 	GtkWidget *transfer_tab;
 	GtkWidget *favorites_tab;
+	GtkWidget *jobs_tab;
 	GPtrArray *remotes;
 	guint i;
 
@@ -1679,7 +1967,7 @@ rclone_window_new (GtkWindow *parent)
 
 	self->window = gtk_window_new (GTK_WINDOW_TOPLEVEL);
 	gtk_window_set_title (GTK_WINDOW (self->window), _("Rclone"));
-	gtk_window_set_default_size (GTK_WINDOW (self->window), 820, 600);
+	gtk_window_set_default_size (GTK_WINDOW (self->window), 860, 640);
 	gtk_window_set_transient_for (GTK_WINDOW (self->window), parent);
 	gtk_window_set_destroy_with_parent (GTK_WINDOW (self->window), FALSE);
 	gtk_window_set_type_hint (GTK_WINDOW (self->window), GDK_WINDOW_TYPE_HINT_DIALOG);
@@ -1690,6 +1978,11 @@ rclone_window_new (GtkWindow *parent)
 	transfer_tab = build_transfer_tab (self);
 	gtk_notebook_append_page (GTK_NOTEBOOK (notebook), transfer_tab,
 	                          gtk_label_new (_("Transfer")));
+
+	jobs_tab = build_jobs_tab (self);
+	self->jobs_tab_index = gtk_notebook_get_n_pages (GTK_NOTEBOOK (notebook));
+	gtk_notebook_append_page (GTK_NOTEBOOK (notebook), jobs_tab,
+	                          gtk_label_new (_("Jobs")));
 
 	favorites_tab = build_favorites_tab (self);
 	gtk_notebook_append_page (GTK_NOTEBOOK (notebook), favorites_tab,
@@ -1711,6 +2004,9 @@ rclone_window_new (GtkWindow *parent)
 
 	reload_favorites (self);
 	self->status_timer = g_timeout_add_seconds (2, favorites_status_tick, self);
+
+	g_signal_connect (self->job_manager, "changed",
+	                  G_CALLBACK (jobs_refresh), self);
 
 	g_signal_connect (self->window, "delete-event",
 	                  G_CALLBACK (on_delete_event), self);
