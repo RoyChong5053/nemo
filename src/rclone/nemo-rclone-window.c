@@ -22,6 +22,7 @@
 #include <glib/gi18n.h>
 #include <json-glib/json-glib.h>
 #include <string.h>
+#include <stdlib.h>
 
 typedef struct {
 	GtkWidget *window;
@@ -2089,6 +2090,135 @@ typedef struct {
 /* Apply the column-visibility settings to the Jobs tree view. */
 static void jobs_apply_column_visibility (RcloneWindow *self);
 
+/* Tunable byte-size unit suffixes (K/M/G/T, plus plain bytes) and duration
+   units (s/m/h/d) used to build compact spin+combo rows for the mount options. */
+static const char *const byte_units[] = { "", "K", "M", "G", "T" };
+static const char *const time_units[] = { "s", "m", "h", "d" };
+
+/* Parse a suffixed mount value such as "128M", "10m" or "0" into a numeric
+   value plus its unit string.  Caller frees *unit. */
+static void
+parse_mount_value (const char *text, double *value, char **unit)
+{
+	if (text == NULL) {
+		*value = 0.0;
+		*unit = g_strdup ("");
+		return;
+	}
+	char *end = NULL;
+	double v = strtod (text, &end);
+	if (end == text) {
+		*value = 0.0;
+		*unit = g_strdup ("");
+		return;
+	}
+	*value = v;
+	*unit = g_strdup (end);
+}
+
+/* Index of a unit string in the given table, or 0 when absent. */
+static int
+unit_index (const char *const *units, int n_units, const char *unit)
+{
+	int i;
+	if (unit == NULL)
+		return 0;
+	for (i = 0; i < n_units; i++)
+		if (g_strcmp0 (units[i], unit) == 0)
+			return i;
+	return 0;
+}
+
+/* Record of the widgets for one mount-options field. */
+typedef struct {
+	GtkWidget *spin;
+	GtkWidget *unit_combo;
+} MountField;
+
+/* Widgets for the whole Mount / FUSE section, so the response callback can
+   read the chosen values back. */
+typedef struct {
+	GtkWidget *mode_combo;
+	GtkWidget *chunk_spin;
+	GtkWidget *max_size_spin, *max_size_unit;
+	GtkWidget *read_ahead_spin, *read_ahead_unit;
+	GtkWidget *max_age_spin, *max_age_unit;
+	GtkWidget *dir_cache_spin, *dir_cache_unit;
+	GtkWidget *attr_spin, *attr_unit;
+	GtkWidget *poll_spin, *poll_unit;
+} MountData;
+
+/* Return the unit currently chosen in a field's unit combo, freshly allocated
+   (caller frees).  Returns an empty string when the field has no unit combo
+   (e.g. the read-chunk-streams spin). */
+static char *
+get_field_unit (GtkWidget *unit_combo)
+{
+	if (unit_combo == NULL)
+		return g_strdup ("");
+	return gtk_combo_box_text_get_active_text (
+		GTK_COMBO_BOX_TEXT (unit_combo));
+}
+
+/* Set *dest to a freshly allocated "VALUEunit" string (freeing the old one).
+   Used to turn a numeric spin + unit combo back into a rclone flag value. */
+static void
+free_suffixed_field (char **dest,
+                     double value,
+                     const char *unit)
+{
+	char *s;
+
+	if (dest == NULL || unit == NULL)
+		return;
+
+	s = g_strdup_printf ("%.0f%s", value, unit);
+	g_free (*dest);
+	*dest = s;
+}
+
+/* Build one mount-options row: label, a numeric spin and (when n_units > 1)
+   a unit dropdown.  The current value is split into spin value + unit index.
+   Fills *out with the widgets so the caller can read them back. */
+static void
+mount_add_field (GtkGrid *grid, int y, const char *label,
+                 double value, const char *unit,
+                 const char *const *units, int n_units,
+                 MountField *out)
+{
+	GtkWidget *spin, *combo;
+	int unit_i;
+
+	if (n_units > 1 && unit != NULL)
+		unit_i = unit_index (units, n_units, unit);
+	else
+		unit_i = 0;
+
+	spin = gtk_spin_button_new_with_range (0, 1e9, 1);
+	gtk_spin_button_set_digits (GTK_SPIN_BUTTON (spin), 0);
+	gtk_spin_button_set_value (GTK_SPIN_BUTTON (spin), value);
+
+	combo = gtk_combo_box_text_new ();
+	{
+		int i;
+		for (i = 0; i < n_units; i++)
+			gtk_combo_box_text_append_text (GTK_COMBO_BOX_TEXT (combo),
+			                                units[i]);
+		if (n_units > 1)
+			gtk_combo_box_set_active (GTK_COMBO_BOX (combo), unit_i);
+	}
+
+	if (out != NULL) {
+		out->spin = spin;
+		out->unit_combo = (n_units > 1) ? combo : NULL;
+	}
+
+	gtk_grid_attach (grid, gtk_label_new (label), 0, y, 1, 1);
+	gtk_grid_attach (grid, spin, 1, y, 1, 1);
+	if (n_units > 1)
+		gtk_grid_attach (grid, combo, 2, y, 1, 1);
+}
+
 /* Called when the Jobs settings dialog is dismissed.  Reads the chosen
    values (only when OK was pressed), persists them, and restarts the
    live-update timer so the new refresh rate takes effect immediately. */
@@ -2128,6 +2258,70 @@ jobs_settings_response_cb (GtkDialog *dialog,
 				GTK_TOGGLE_BUTTON (data->check_job));
 	}
 
+	/* Mount / FUSE options: read the edited widgets back and persist them,
+	   so the "mount a remote" function has a settings option too. */
+	{
+		MountData *mdata = g_object_get_data (
+			G_OBJECT (dialog), "rclone-mount-settings");
+		RcloneMountOpts *opts;
+		char *u;
+
+		if (mdata != NULL) {
+			opts = nemo_rclone_service_get_mount_opts ();
+
+			opts->vfs_cache_mode =
+				g_strdup (gtk_combo_box_text_get_active_text (
+					GTK_COMBO_BOX_TEXT (mdata->mode_combo)));
+
+			{
+				gint64 chunk =
+					gtk_spin_button_get_value_as_int (
+						GTK_SPIN_BUTTON (mdata->chunk_spin));
+				opts->read_chunk_streams =
+					(chunk > 0) ? chunk : 8;
+			}
+
+			u = get_field_unit (mdata->max_size_unit);
+			free_suffixed_field (&opts->vfs_cache_max_size,
+				gtk_spin_button_get_value (
+					GTK_SPIN_BUTTON (mdata->max_size_spin)), u);
+			g_free (u);
+
+			u = get_field_unit (mdata->read_ahead_unit);
+			free_suffixed_field (&opts->read_ahead,
+				gtk_spin_button_get_value (
+					GTK_SPIN_BUTTON (mdata->read_ahead_spin)), u);
+			g_free (u);
+
+			u = get_field_unit (mdata->max_age_unit);
+			free_suffixed_field (&opts->vfs_cache_max_age,
+				gtk_spin_button_get_value (
+					GTK_SPIN_BUTTON (mdata->max_age_spin)), u);
+			g_free (u);
+
+			u = get_field_unit (mdata->dir_cache_unit);
+			free_suffixed_field (&opts->dir_cache_time,
+				gtk_spin_button_get_value (
+					GTK_SPIN_BUTTON (mdata->dir_cache_spin)), u);
+			g_free (u);
+
+			u = get_field_unit (mdata->attr_unit);
+			free_suffixed_field (&opts->attr_timeout,
+				gtk_spin_button_get_value (
+					GTK_SPIN_BUTTON (mdata->attr_spin)), u);
+			g_free (u);
+
+			u = get_field_unit (mdata->poll_unit);
+			free_suffixed_field (&opts->poll_interval,
+				gtk_spin_button_get_value (
+					GTK_SPIN_BUTTON (mdata->poll_spin)), u);
+			g_free (u);
+
+			nemo_rclone_service_save_mount_opts (opts);
+			nemo_rclone_service_free_mount_opts (opts);
+		}
+	}
+
 	jobs_apply_column_visibility (self);
 
 	jobs_settings_save (self);
@@ -2154,7 +2348,7 @@ build_jobs_settings_dialog (RcloneWindow *self)
 	GtkWidget *rate_label;
 	JobsSettingsData *data;
 
-	dialog = gtk_dialog_new_with_buttons (_("Jobs Settings"),
+	dialog = gtk_dialog_new_with_buttons (_("Rclone Settings"),
 	                                      GTK_WINDOW (self->window),
 	                                      GTK_DIALOG_MODAL,
 	                                      "_Cancel", GTK_RESPONSE_CANCEL,
@@ -2206,6 +2400,129 @@ build_jobs_settings_dialog (RcloneWindow *self)
 	gtk_toggle_button_set_active (GTK_TOGGLE_BUTTON (data->check_job),
 	                              self->jobs_show_job);
 	gtk_grid_attach (GTK_GRID (grid), data->check_job, 0, 5, 2, 1);
+
+	/* Mount / FUSE cache options: tunables that build_mount_argv() in the
+	   service reads when starting a mount.  These give the user a settings
+	   option for the "mount a remote" function. */
+	{
+		GtkWidget *sep;
+		GtkWidget *mount_title;
+		RcloneMountOpts *opts;
+		MountData *mdata;
+		GtkWidget *mode_combo;
+		GtkWidget *chunk_spin;
+		MountField f;
+
+		sep = gtk_separator_new (GTK_ORIENTATION_HORIZONTAL);
+		gtk_grid_attach (GTK_GRID (grid), sep, 0, 6, 3, 1);
+
+		mount_title = gtk_label_new (NULL);
+		gtk_label_set_markup (GTK_LABEL (mount_title),
+		                      "<b>Mount / FUSE cache</b>");
+		gtk_label_set_xalign (GTK_LABEL (mount_title), 0.0);
+		gtk_grid_attach (GTK_GRID (grid), mount_title, 0, 7, 3, 1);
+
+		opts = nemo_rclone_service_get_mount_opts ();
+
+		mdata = g_new0 (MountData, 1);
+
+		/* vfs-cache-mode selector. */
+		mode_combo = gtk_combo_box_text_new ();
+		{
+			const char *const modes[] = {
+				"off", "minimal", "cheap", "full"
+			};
+			int i;
+			for (i = 0; i < 4; i++)
+				gtk_combo_box_text_append_text (
+					GTK_COMBO_BOX_TEXT (mode_combo), modes[i]);
+			gtk_combo_box_set_active (
+				GTK_COMBO_BOX (mode_combo),
+				unit_index (modes, 4, opts->vfs_cache_mode));
+		}
+		gtk_grid_attach (GTK_GRID (grid), mode_combo, 0, 8, 1, 1);
+		gtk_grid_attach (GTK_GRID (grid),
+		                 gtk_label_new ("Cache mode:"), 1, 8, 2, 1);
+		mdata->mode_combo = mode_combo;
+
+		/* read-chunk-streams (plain integer, no unit). */
+		chunk_spin = gtk_spin_button_new_with_range (1, 64, 1);
+		gtk_spin_button_set_digits (GTK_SPIN_BUTTON (chunk_spin), 0);
+		gtk_spin_button_set_value (GTK_SPIN_BUTTON (chunk_spin),
+		                           opts->read_chunk_streams);
+		gtk_grid_attach (GTK_GRID (grid), chunk_spin, 1, 9, 2, 1);
+		mdata->chunk_spin = chunk_spin;
+
+		/* Byte-sized fields: vfs-cache-max-size, read-ahead.  The stored
+	   value is a suffixed string ("2G", "128M") so split it into a
+	   numeric spin value and a unit before handing it to the row. */
+		{
+			double v;
+			char *u;
+			parse_mount_value (opts->vfs_cache_max_size, &v, &u);
+			mount_add_field (GTK_GRID (grid), 10, "Max cache size:",
+			                 v, u, byte_units,
+			                 G_N_ELEMENTS (byte_units), &f);
+			g_free (u);
+			mdata->max_size_spin = f.spin;
+			mdata->max_size_unit = f.unit_combo;
+
+			parse_mount_value (opts->read_ahead, &v, &u);
+			mount_add_field (GTK_GRID (grid), 11, "Read-ahead:",
+			                 v, u, byte_units,
+			                 G_N_ELEMENTS (byte_units), &f);
+			g_free (u);
+			mdata->read_ahead_spin = f.spin;
+			mdata->read_ahead_unit = f.unit_combo;
+		}
+
+		/* Time fields: vfs-cache-max-age, dir-cache-time, attr-timeout,
+		   poll-interval.  Split the stored "10m"/"1h"/"0" values. */
+		{
+			double v;
+			char *u;
+			parse_mount_value (opts->vfs_cache_max_age, &v, &u);
+			mount_add_field (GTK_GRID (grid), 12, "Cache age:",
+			                 v, u, time_units,
+			                 G_N_ELEMENTS (time_units), &f);
+			g_free (u);
+			mdata->max_age_spin = f.spin;
+			mdata->max_age_unit = f.unit_combo;
+
+			parse_mount_value (opts->dir_cache_time, &v, &u);
+			mount_add_field (GTK_GRID (grid), 13, "Dir cache time:",
+			                 v, u, time_units,
+			                 G_N_ELEMENTS (time_units), &f);
+			g_free (u);
+			mdata->dir_cache_spin = f.spin;
+			mdata->dir_cache_unit = f.unit_combo;
+
+			parse_mount_value (opts->attr_timeout, &v, &u);
+			mount_add_field (GTK_GRID (grid), 14, "Attr timeout:",
+			                 v, u, time_units,
+			                 G_N_ELEMENTS (time_units), &f);
+			g_free (u);
+			mdata->attr_spin = f.spin;
+			mdata->attr_unit = f.unit_combo;
+
+			parse_mount_value (opts->poll_interval, &v, &u);
+			mount_add_field (GTK_GRID (grid), 15, "Poll interval:",
+			                 v, u, time_units,
+			                 G_N_ELEMENTS (time_units), &f);
+			g_free (u);
+			mdata->poll_spin = f.spin;
+			mdata->poll_unit = f.unit_combo;
+		}
+
+		/* opts has served its purpose (initialising the widgets); free it
+		   now.  The user's edited values are read from the widgets later,
+		   in jobs_settings_response_cb(). */
+		nemo_rclone_service_free_mount_opts (opts);
+
+		g_object_set_data_full (G_OBJECT (dialog),
+		                        "rclone-mount-settings", mdata,
+		                        g_free);
+	}
 
 	g_object_set_data (G_OBJECT (dialog),
 	                   "rclone-jobs-settings", data);

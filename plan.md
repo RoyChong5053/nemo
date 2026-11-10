@@ -53,7 +53,7 @@
 5. **右键菜单 Rclone**：Open Transfer / Mark as Favorite / Copy Path / Use as Source
 6. **FORK.md** 已更新（mount 段、已知限制）
 
-### 挂载参数模板（固定）
+### 挂载参数模板（已由“Mount / FUSE cache”设定对话框可调，见 P1.5）
 ```
 --vfs-cache-mode full --vfs-read-ahead 128M --vfs-read-chunk-streams 8
 --dir-cache-time 10m --attr-timeout 1m --poll-interval 0
@@ -241,6 +241,28 @@ Nemo 视图 ── FUSE mount ── rclone VFS ── remote
       `show_state/progress/speed/job`（四列显示/隐藏，对话框点 OK 即时生效）。
       配置以 JSON 存于 `~/.config/nemo/rclone-jobs.json`（load/save 用 json-glib，
       `_with_default` 安全读取）。
+- **P1.5 FUSE / mount 参数可设置** — ✅ 已完成（2026-11-11）
+   - 目标：让“mount a remote”这个功能也有对应的设定选项（每个功能一个选项），
+     并把 FUSE 表现调优项直接暴露给用户。
+   - 在 Jobs “Settings” 对话框内新增 **“Mount / FUSE cache”** 小节（不另开对话框，
+     复用现有对话框 + response-callback 模式）：
+     - `vfs-cache-mode` 下拉（off / minimal / cheap / full）
+     - `read-chunk-streams` 整数 spin（≥1，默认 8）
+     - 带单位的字节字段：`vfs-cache-max-size`、`read-ahead`
+     - 带单位的时间字段：`vfs-cache-max-age`、`dir-cache-time`、`attr-timeout`、`poll-interval`
+   - 数值在 `jobs_settings_response_cb`（点 OK 时）读取，解析存于
+     `~/.config/nemo/rclone-mount.json`（`mount_opts_save/load/free`），
+     读侧 `mount_opts_load` 只在实际命中成员时才覆盖默认值（部分文件保留其它默认）。
+   - 服务侧 `build_mount_argv()` 全部读取这 8 项（`g_assert(n<36)` 保证 argv 不溢出）。
+   - **修了一个 json-glib 真 bug**：`mount_opts_save` 里 `json_builder_get_root()`
+     后又 `g_object_unref(root)` 重复释放（本仓库这版 json-glib 的
+     `json_generator_set_root` 已接管 root 所有权），导致保存 mount 参数时 SIGSEGV；
+     已去掉多余的 unref（对照 `save_favorites` 的正确写法）。
+   - 新增 `test/rclone-mount-opts-test.c`：用 `XDG_CONFIG_HOME` 临时目录做保存→重载
+     往返断言，`meson test 'Rclone mount options'` 可跑（依赖 `glib, json, gtk`）。
+   - **待办**：`--vfs-write-back`、`--timeout`、`--sftp-concurrency` 等按 profile 区分
+     （P3），以及把“mount profile”做成独立下拉（balanced / browse-fast /
+     upload-heavy / low-power-SFTP）。
 - **P2 RC 统计 / FUSE 上传可见**
   - mount argv 加 `--rc` socket；JobManager 轮询 `vfs/queue`、`vfs/stats`。
   - copy 进挂载点后，Nemo 进度到 100% 时 Jobs 页继续显示 “Uploading to <remote>” 直到 queue 清空。

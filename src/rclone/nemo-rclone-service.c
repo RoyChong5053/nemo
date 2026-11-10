@@ -1356,6 +1356,206 @@ nemo_rclone_service_favorite_is_mounted (NemoRcloneService *self,
 	return FALSE;
 }
 
+/* Tunable FUSE/mount options for a single rclone mount.  All string fields
+   are newly-allocated and owned by the caller; free a whole set with
+   mount_opts_free().  The RcloneMountOpts type is declared in the header.
+   Values come from ~/.config/nemo/rclone-mount.json and fall back to the
+   defaults below so a missing/invalid file still mounts. */
+static void
+mount_opts_free (RcloneMountOpts *o)
+{
+	if (o == NULL)
+		return;
+	g_free (o->vfs_cache_mode);
+	g_free (o->vfs_cache_max_size);
+	g_free (o->vfs_cache_max_age);
+	g_free (o->read_ahead);
+	g_free (o->dir_cache_time);
+	g_free (o->attr_timeout);
+	g_free (o->poll_interval);
+	g_free (o);
+}
+
+/* Default FUSE/mount options.  These favour responsiveness on slow remotes:
+   full cache mode with bounded cache size/age so the cache can never grow
+   without limit (which is what turns a slow disk into a frozen one). */
+static RcloneMountOpts *
+mount_opts_defaults (void)
+{
+	RcloneMountOpts *o = g_new0 (RcloneMountOpts, 1);
+	o->vfs_cache_mode = g_strdup ("full");
+	o->vfs_cache_max_size = g_strdup ("2G");
+	o->vfs_cache_max_age = g_strdup ("24h");
+	o->read_ahead = g_strdup ("128M");
+	o->read_chunk_streams = 8;
+	o->dir_cache_time = g_strdup ("10m");
+	o->attr_timeout = g_strdup ("1m");
+	o->poll_interval = g_strdup ("0");
+	return o;
+}
+
+/* Path to the mount options store.  Caller frees. */
+static char *
+mount_opts_path (void)
+{
+	char *config_dir;
+	char *path;
+
+	config_dir = g_build_filename (g_get_user_config_dir (), "nemo", NULL);
+	g_mkdir_with_parents (config_dir, 0700);
+	path = g_build_filename (config_dir, "rclone-mount.json", NULL);
+	g_free (config_dir);
+	return path;
+}
+
+/* Load mount options from disk, filling any missing/invalid field with its
+   default.  Returns a fresh set owned by the caller. */
+static RcloneMountOpts *
+mount_opts_load (void)
+{
+	RcloneMountOpts *o = mount_opts_defaults ();
+	char *path = mount_opts_path ();
+	char *contents = NULL;
+	JsonParser *parser = NULL;
+	JsonNode *root = NULL;
+	JsonObject *object = NULL;
+
+	if (!g_file_get_contents (path, &contents, NULL, NULL))
+		goto out;   /* no file yet -> defaults */
+
+	parser = json_parser_new ();
+	if (!json_parser_load_from_data (parser, contents, -1, NULL))
+		goto out;
+
+	root = json_parser_get_root (parser);
+	if (root == NULL || !JSON_NODE_HOLDS_OBJECT (root))
+		goto out;
+
+	object = json_node_get_object (root);
+
+	/* Only replace a default with a stored value when that value is
+	   actually present, so a partial file keeps the other defaults. */
+	if (json_object_has_member (object, "vfs_cache_mode")) {
+		g_free (o->vfs_cache_mode);
+		o->vfs_cache_mode =
+			g_strdup (json_string_or_empty (object, "vfs_cache_mode"));
+	}
+	if (json_object_has_member (object, "vfs_cache_max_size")) {
+		g_free (o->vfs_cache_max_size);
+		o->vfs_cache_max_size =
+			g_strdup (json_string_or_empty (object, "vfs_cache_max_size"));
+	}
+	if (json_object_has_member (object, "vfs_cache_max_age")) {
+		g_free (o->vfs_cache_max_age);
+		o->vfs_cache_max_age =
+			g_strdup (json_string_or_empty (object, "vfs_cache_max_age"));
+	}
+	if (json_object_has_member (object, "read_ahead")) {
+		g_free (o->read_ahead);
+		o->read_ahead =
+			g_strdup (json_string_or_empty (object, "read_ahead"));
+	}
+	if (json_object_has_member (object, "dir_cache_time")) {
+		g_free (o->dir_cache_time);
+		o->dir_cache_time =
+			g_strdup (json_string_or_empty (object, "dir_cache_time"));
+	}
+	if (json_object_has_member (object, "attr_timeout")) {
+		g_free (o->attr_timeout);
+		o->attr_timeout =
+			g_strdup (json_string_or_empty (object, "attr_timeout"));
+	}
+	if (json_object_has_member (object, "poll_interval")) {
+		g_free (o->poll_interval);
+		o->poll_interval =
+			g_strdup (json_string_or_empty (object, "poll_interval"));
+	}
+
+	if (json_object_has_member (object, "read_chunk_streams")) {
+		gint v = json_object_get_int_member (object, "read_chunk_streams");
+		o->read_chunk_streams = (v > 0) ? v : 8;
+	}
+
+out:
+	g_free (contents);
+	if (parser != NULL)
+		g_object_unref (parser);
+	g_free (path);
+	return o;
+}
+
+/* Persist mount options to disk.  Missing on success. */
+static void
+mount_opts_save (const RcloneMountOpts *o)
+{
+	JsonBuilder *builder;
+	JsonGenerator *gen;
+	JsonNode *root;
+	char *path;
+	char *contents;
+
+	builder = json_builder_new ();
+	json_builder_begin_object (builder);
+
+	json_builder_set_member_name (builder, "vfs_cache_mode");
+	json_builder_add_string_value (builder, o->vfs_cache_mode);
+	json_builder_set_member_name (builder, "vfs_cache_max_size");
+	{
+		const char *max_size =
+			(o->vfs_cache_max_size != NULL &&
+			 o->vfs_cache_max_size[0] != '\0') ?
+			o->vfs_cache_max_size : "";
+		json_builder_add_string_value (builder, max_size);
+	}
+	json_builder_set_member_name (builder, "vfs_cache_max_age");
+	json_builder_add_string_value (builder, o->vfs_cache_max_age);
+	json_builder_set_member_name (builder, "read_ahead");
+	json_builder_add_string_value (builder, o->read_ahead);
+	json_builder_set_member_name (builder, "read_chunk_streams");
+	json_builder_add_int_value (builder, o->read_chunk_streams);
+	json_builder_set_member_name (builder, "dir_cache_time");
+	json_builder_add_string_value (builder, o->dir_cache_time);
+	json_builder_set_member_name (builder, "attr_timeout");
+	json_builder_add_string_value (builder, o->attr_timeout);
+	json_builder_set_member_name (builder, "poll_interval");
+	json_builder_add_string_value (builder, o->poll_interval);
+
+	json_builder_end_object (builder);
+
+	root = json_builder_get_root (builder);
+	gen = json_generator_new ();
+	json_generator_set_root (gen, root);
+	contents = json_generator_to_data (gen, NULL);
+
+	path = mount_opts_path ();
+	g_file_set_contents (path, contents, -1, NULL);
+
+	g_free (contents);
+	g_free (path);
+	g_object_unref (gen);
+	g_object_unref (builder);
+}
+
+/* Public wrappers used by the settings UI (see nemo-rclone-window.c). */
+RcloneMountOpts *
+nemo_rclone_service_get_mount_opts (void)
+{
+	return mount_opts_load ();
+}
+
+void
+nemo_rclone_service_save_mount_opts (RcloneMountOpts *opts)
+{
+	if (opts != NULL)
+		mount_opts_save (opts);
+}
+
+void
+nemo_rclone_service_free_mount_opts (RcloneMountOpts *opts)
+{
+	mount_opts_free (opts);
+}
+
 /* Build argv for "rclone mount <spec> <mountpoint> --vfs-flags".  The returned
    argv is NULL-terminated and owned by the caller.  spec is taken into argv,
    so this frees it (no caller return needed). */
@@ -1367,7 +1567,8 @@ build_mount_argv (NemoRcloneService *self,
 {
 	char *spec, *cache_dir, *log_path, *log_dir;
 	char **argv;
-	int n = 0;
+	int n;
+	RcloneMountOpts *opts = mount_opts_load ();
 
 	(void) self;
 
@@ -1377,23 +1578,45 @@ build_mount_argv (NemoRcloneService *self,
 	g_mkdir_with_parents (log_dir, 0700);
 	g_free (log_dir);
 
+	/* 36 slots is generous for the base args plus every optional VFS flag. */
 	argv = g_malloc (sizeof (char *) * 36);
+	n = 0;
 	argv[n++] = g_strdup ("rclone");
 	argv[n++] = g_strdup ("mount");
 	argv[n++] = spec;
 	argv[n++] = g_strdup (mountpoint);
+
+	/* --- cache / read tuning: the heart of FUSE responsiveness ---
+	   Full cache mode keeps recently-read bytes locally so revisiting a
+	   slow remote feels instant; bounded size+age stop the cache from
+	   growing until the disk fills (which is what freezes a mount). */
 	argv[n++] = g_strdup ("--vfs-cache-mode");
-	argv[n++] = g_strdup ("full");
+	argv[n++] = g_strdup (opts->vfs_cache_mode);
+	if (opts->vfs_cache_max_size != NULL &&
+	    opts->vfs_cache_max_size[0] != '\0') {
+		argv[n++] = g_strdup ("--vfs-cache-max-size");
+		argv[n++] = g_strdup (opts->vfs_cache_max_size);
+	}
+	if (opts->vfs_cache_max_age != NULL &&
+	    opts->vfs_cache_max_age[0] != '\0') {
+		argv[n++] = g_strdup ("--vfs-cache-max-age");
+		argv[n++] = g_strdup (opts->vfs_cache_max_age);
+	}
 	argv[n++] = g_strdup ("--vfs-read-ahead");
-	argv[n++] = g_strdup ("128M");
+	argv[n++] = g_strdup (opts->read_ahead);
 	argv[n++] = g_strdup ("--vfs-read-chunk-streams");
-	argv[n++] = g_strdup ("8");
+	argv[n++] = g_strdup_printf ("%d", opts->read_chunk_streams);
 	argv[n++] = g_strdup ("--dir-cache-time");
-	argv[n++] = g_strdup ("10m");
+	argv[n++] = g_strdup (opts->dir_cache_time);
 	argv[n++] = g_strdup ("--attr-timeout");
-	argv[n++] = g_strdup ("1m");
+	argv[n++] = g_strdup (opts->attr_timeout);
 	argv[n++] = g_strdup ("--poll-interval");
-	argv[n++] = g_strdup ("0");
+	argv[n++] = g_strdup (opts->poll_interval);
+	/* omit-mountpoint-in-errors keeps FUSE error paths from leaking the
+	   local mountpoint (an Android path) into rclone's messages. */
+	argv[n++] = g_strdup ("--vfs-flags");
+	argv[n++] = g_strdup ("omit-mountpoint-in-errors");
+
 	cache_dir = g_build_filename (g_get_user_cache_dir (),
 	                              "rclone", "vfs", NULL);
 	argv[n++] = g_strdup ("--cache-dir");
@@ -1410,7 +1633,10 @@ build_mount_argv (NemoRcloneService *self,
 	argv[n++] = g_strdup ("1s");
 	argv[n++] = NULL;
 
+	g_assert (n < 36);
+
 	g_free (cache_dir);
+	mount_opts_free (opts);
 
 	*argv_out = argv;
 }

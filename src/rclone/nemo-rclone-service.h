@@ -23,6 +23,20 @@ typedef struct {
 	char *mountpoint;
 } NemoRcloneFavorite;
 
+/* Tunable FUSE/mount options for a single rclone mount.  All string fields
+   are newly-allocated and owned by the caller; free a whole set with
+   nemo_rclone_service_free_mount_opts().  "" means "use rclone's default". */
+typedef struct {
+	char *vfs_cache_mode;
+	char *vfs_cache_max_size;
+	char *vfs_cache_max_age;
+	char *read_ahead;
+	gint read_chunk_streams;
+	char *dir_cache_time;
+	char *attr_timeout;
+	char *poll_interval;
+} RcloneMountOpts;
+
 #define NEMO_TYPE_RCLONE_SERVICE (nemo_rclone_service_get_type ())
 G_DECLARE_FINAL_TYPE (NemoRcloneService, nemo_rclone_service,
                       NEMO, RCLONE_SERVICE, GObject)
@@ -99,6 +113,16 @@ char               *nemo_rclone_service_mount_favorite    (NemoRcloneService *se
 
 /* Unmount the favorite identified by id (if mounted) and clear its persisted
    mountpoint.  Returns TRUE on success (or if nothing to do). */
+/* Free a set previously returned by nemo_rclone_service_get_mount_opts(). */
+void                nemo_rclone_service_free_mount_opts     (RcloneMountOpts   *opts);
+
+/* Load the persisted FUSE/mount options (see ~/.config/nemo/rclone-mount.json,
+   falling back to sensible defaults).  Returns a fresh set the caller owns. */
+RcloneMountOpts    *nemo_rclone_service_get_mount_opts      (void);
+
+/* Persist the given FUSE/mount options to disk.  The set keeps being owned by
+   the caller. */
+void                nemo_rclone_service_save_mount_opts     (RcloneMountOpts   *opts);
 gboolean            nemo_rclone_service_unmount_favorite  (NemoRcloneService *self,
                                                            const char        *id,
                                                            GError           **error);

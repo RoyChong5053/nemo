@@ -44,3 +44,13 @@ test('Rclone path semantics',
   ),
   args: []
 )
+
+test('Rclone mount options',
+  executable('test-rclone-mount-opts',
+    [ 'rclone-mount-opts-test.c', '../src/rclone/nemo-rclone-service.c',
+      '../src/rclone/nemo-rclone-path.c' ],
+    include_directories: [ rootInclude, include_directories('../src/rclone') ],
+    dependencies: [ glib, json, gtk ],
+  ),
+  args: []
+)
