@@ -54,3 +54,14 @@ test('Rclone mount options',
   ),
   args: []
 )
+
+test('Rclone job concurrency',
+  executable('test-rclone-job-concurrency',
+    [ 'rclone-job-concurrency-test.c',
+      '../src/rclone/nemo-rclone-job.c',
+      '../src/rclone/nemo-rclone-job-manager.c' ],
+    include_directories: [ rootInclude, include_directories('../src/rclone') ],
+    dependencies: [ glib, json, nemo_private ],
+  ),
+  args: []
+)

@@ -241,6 +241,13 @@ Nemo 视图 ── FUSE mount ── rclone VFS ── remote
       `show_state/progress/speed/job`（四列显示/隐藏，对话框点 OK 即时生效）。
       配置以 JSON 存于 `~/.config/nemo/rclone-jobs.json`（load/save 用 json-glib，
       `_with_default` 安全读取）。
+   - **并行 Job 防回归测试**（`test/rclone-job-concurrency-test.c`，
+     `meson test` 可跑，约 0.05s）：起两个真实 rclone copy（本地文件，
+     `NEMO_RCLONE_RUNTIME_DIR/_CACHE_DIR` 隔离），断言 job 引擎让它们
+     各自独立 —— 不同 id、不同 RC socket、同时处于 running
+     （`count_running() == 2`）、最终各自独立到 100% 且都计入 finished。
+     直击用户“复制两条路径只显示一个”的痛点；旧的单进程实现会被这个测试
+     抓出来（只记 1 个 job / 第二个覆盖第一个）。
 - **P1.5 FUSE / mount 参数可设置** — ✅ 已完成（2026-11-11）
    - 目标：让“mount a remote”这个功能也有对应的设定选项（每个功能一个选项），
      并把 FUSE 表现调优项直接暴露给用户。
