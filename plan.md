@@ -230,7 +230,17 @@ Nemo 视图 ── FUSE mount ── rclone VFS ── remote
      修复本仓库非标准 GTK3 API 适配（`gtk_notebook_get_n_pages`、
      `gtk_tree_selection_get_selected(&model, …)`、`gtk_text_buffer_set_text(…, -1)`、
      移除错误的 `gtk_tree_view_set_attributes`、新增 `nemo-progress-info.h` 包含）。
-   - 待办：`nemo-rclone-rc.[ch]` 轮询、`GNotification`、侧边栏计数、CSS 美化（≤4Hz 平滑）。
+    - 待办：`nemo-rclone-rc.[ch]` 轮询、`GNotification`、侧边栏计数。
+    - **进度界面美化（≤4Hz 平滑 + 状态着色 + glyph）**：每行 State 列显示
+      “状态色 glyph + 文字”（▶ Running / ✔ Done / ✗ Failed / ⊘ Cancelled / • Queued），
+      颜色按状态着色（蓝/绿/红/橙/灰），`jobs_live_tick` 用 `g_timeout_add` 按
+      `tick_rate_hz`（1–4 Hz，250–1000 ms）就地刷新进度/速度字符串，
+      重调度时即时生效、不重排列表、不打扰选中项。
+    - **每个功能对应一个设定选项**：Jobs 页 “Settings” 对话框支持
+      `tick_rate_hz`（刷新率）、`auto_clear`（自动清已完成）、
+      `show_state/progress/speed/job`（四列显示/隐藏，对话框点 OK 即时生效）。
+      配置以 JSON 存于 `~/.config/nemo/rclone-jobs.json`（load/save 用 json-glib，
+      `_with_default` 安全读取）。
 - **P2 RC 统计 / FUSE 上传可见**
   - mount argv 加 `--rc` socket；JobManager 轮询 `vfs/queue`、`vfs/stats`。
   - copy 进挂载点后，Nemo 进度到 100% 时 Jobs 页继续显示 “Uploading to <remote>” 直到 queue 清空。

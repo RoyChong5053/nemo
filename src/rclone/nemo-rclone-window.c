@@ -72,6 +72,14 @@ typedef struct {
 	GtkWidget *jobs_speed;
 	guint jobs_selected;
 	guint jobs_timer;
+
+	/* Jobs-page settings (persisted, see jobs_settings_load/save). */
+	int jobs_tick_rate;      /* progress refresh rate, 1..4 Hz (default 1) */
+	gboolean jobs_show_state;
+	gboolean jobs_show_progress;
+	gboolean jobs_show_speed;
+	gboolean jobs_show_job;
+	gboolean jobs_auto_clear;
 } RcloneWindow;
 
 static RcloneWindow *rclone_window = NULL;
@@ -139,6 +147,204 @@ jobs_refresh (RcloneWindow *self,
               const char *select_id);
 
 /* ------------------------------ Jobs page ------------------------------ */
+
+/* Per-state foreground color (CSS color name) used to paint the State
+   column of the Jobs list.  Gives each job a colored indicator without
+   needing per-state icon resources. */
+static const char *
+jobs_state_color (NemoRcloneJobState state)
+{
+	switch (state) {
+	case NEMO_RCLONE_JOB_RUNNING:
+	case NEMO_RCLONE_JOB_QUEUED:
+		return "#2f6fed";	/* blue */
+	case NEMO_RCLONE_JOB_DONE:
+		return "#2ecc71";	/* green */
+	case NEMO_RCLONE_JOB_FAILED:
+		return "#e74c3c";	/* red */
+	case NEMO_RCLONE_JOB_CANCELLED:
+		return "#e67e22";	/* orange */
+	default:
+		return "#7f8c8d";	/* grey */
+	}
+}
+
+/* Unicode glyph used as an inline "icon" prefix for a state, so the
+   Jobs list has a small visual indicator per row. */
+static const char *
+jobs_state_glyph (NemoRcloneJobState state)
+{
+	switch (state) {
+	case NEMO_RCLONE_JOB_QUEUED:
+		return "•";
+	case NEMO_RCLONE_JOB_RUNNING:
+		return "▶";
+	case NEMO_RCLONE_JOB_DONE:
+		return "✔";
+	case NEMO_RCLONE_JOB_FAILED:
+		return "✗";
+	case NEMO_RCLONE_JOB_CANCELLED:
+		return "⊘";
+	default:
+		return "•";
+	}
+}
+
+/* Build a displayable State string: the state glyph followed by the
+   human-readable label, e.g. "▶ Running".  Owned by the caller. */
+static char *
+jobs_state_display (NemoRcloneJobState state, const char *label)
+{
+	return g_strdup_printf ("%s %s",
+	                         jobs_state_glyph (state),
+	                         label != NULL ? label : "…");
+}
+
+/* The Nemo file-op progress indicator never maps to a JobState, so map
+   the current fraction onto one of the known buckets for coloring. */
+static const char *
+jobs_nemo_state_color (double progress, gboolean running)
+{
+	if (progress >= 1.0)
+		return "#2ecc71";	/* done -> green */
+	if (!running)
+		return "#7f8c8d";	/* not yet started -> grey */
+	return "#2f6fed";		/* running -> blue */
+}
+
+/* Default jobs-page settings applied before any saved config is read. */
+static void
+jobs_settings_defaults (RcloneWindow *self)
+{
+	self->jobs_tick_rate = 1;
+	self->jobs_show_state = TRUE;
+	self->jobs_show_progress = TRUE;
+	self->jobs_show_speed = TRUE;
+	self->jobs_show_job = TRUE;
+	self->jobs_auto_clear = FALSE;
+}
+
+static char *
+jobs_settings_path (void)
+{
+	char *config_dir;
+	char *path;
+
+	config_dir = g_build_filename (g_get_user_config_dir (), "nemo", NULL);
+	path = g_build_filename (config_dir, "rclone-jobs.json", NULL);
+	g_free (config_dir);
+	return path;
+}
+
+/* Load saved jobs settings; missing/malformed values fall back to
+   defaults.  Kept tiny: a single JSON object with six keys. */
+static void
+jobs_settings_load (RcloneWindow *self)
+{
+	char *path;
+	char *contents;
+	JsonParser *parser;
+	JsonNode *root;
+	JsonObject *object;
+
+	jobs_settings_defaults (self);
+
+	path = jobs_settings_path ();
+	if (!g_file_get_contents (path, &contents, NULL, NULL)) {
+		g_free (path);
+		return;
+	}
+	g_free (path);
+
+	parser = json_parser_new ();
+	if (!json_parser_load_from_data (parser, contents, -1, NULL)) {
+		g_free (contents);
+		g_object_unref (parser);
+		return;
+	}
+	g_free (contents);
+
+	root = json_parser_get_root (parser);
+	if (root != NULL && JSON_NODE_HOLDS_OBJECT (root)) {
+		object = json_node_get_object (root);
+
+		if (json_object_has_member (object, "tick_rate_hz")) {
+			gint v = json_object_get_int_member (object,
+			                                     "tick_rate_hz");
+			if (v >= 1 && v <= 4)
+				self->jobs_tick_rate = v;
+		}
+		self->jobs_show_state =
+			json_object_get_boolean_member_with_default (object,
+			                                "show_state",
+			                                TRUE);
+		self->jobs_show_progress =
+			json_object_get_boolean_member_with_default (object,
+			                                "show_progress",
+			                                TRUE);
+		self->jobs_show_speed =
+			json_object_get_boolean_member_with_default (object,
+			                                "show_speed",
+			                                TRUE);
+		self->jobs_show_job =
+			json_object_get_boolean_member_with_default (object,
+			                                "show_job",
+			                                TRUE);
+		self->jobs_auto_clear =
+			json_object_get_boolean_member_with_default (object,
+			                                "auto_clear",
+			                                FALSE);
+	}
+
+	g_object_unref (parser);
+}
+
+/* Persist current jobs settings back to the config file. */
+static void
+jobs_settings_save (RcloneWindow *self)
+{
+	JsonBuilder *builder;
+	JsonGenerator *gen;
+	JsonNode *root;
+	char *path;
+	char *contents;
+
+	builder = json_builder_new ();
+	json_builder_begin_object (builder);
+	json_builder_set_member_name (builder, "tick_rate_hz");
+	json_builder_add_int_value (builder, self->jobs_tick_rate);
+	json_builder_set_member_name (builder, "show_state");
+	json_builder_add_boolean_value (builder, self->jobs_show_state);
+	json_builder_set_member_name (builder, "show_progress");
+	json_builder_add_boolean_value (builder, self->jobs_show_progress);
+	json_builder_set_member_name (builder, "show_speed");
+	json_builder_add_boolean_value (builder, self->jobs_show_speed);
+	json_builder_set_member_name (builder, "show_job");
+	json_builder_add_boolean_value (builder, self->jobs_show_job);
+	json_builder_set_member_name (builder, "auto_clear");
+	json_builder_add_boolean_value (builder, self->jobs_auto_clear);
+	json_builder_end_object (builder);
+
+	root = json_builder_get_root (builder);
+	gen = json_generator_new ();
+	json_generator_set_root (gen, root);
+	contents = json_generator_to_data (gen, NULL);
+
+	path = jobs_settings_path ();
+	{
+		char *config_dir = g_path_get_dirname (path);
+		g_mkdir_with_parents (config_dir, 0700);
+		g_free (config_dir);
+	}
+	g_file_set_contents (path, contents, -1, NULL);
+
+	g_free (contents);
+	g_free (path);
+	g_object_unref (gen);
+	g_object_unref (root);
+	g_object_unref (builder);
+}
+
 /*  0: G_TYPE_STRING   row id ("r:<uuid>" or "n:<n>")
     1: G_TYPE_STRING   state label
     2: G_TYPE_STRING   formatted progress ("45%")
@@ -147,6 +353,8 @@ jobs_refresh (RcloneWindow *self,
     5: G_TYPE_BOOLEAN  whether this is a rclone job (else a Nemo op)
     6: G_TYPE_POINTER  rclone job pointer (NULL for Nemo ops)
     7: G_TYPE_POINTER  NemoProgressInfo pointer (NULL for rclone jobs)
+    8: G_TYPE_STRING   foreground CSS color name (paints the state cell)
+    9: G_TYPE_STRING   state glyph (inline visual indicator)
 */
 static void
 jobs_refresh (RcloneWindow *self,
@@ -182,6 +390,7 @@ jobs_refresh (RcloneWindow *self,
 			double frac = nemo_rclone_job_get_fraction (job);
 			double speed = nemo_rclone_job_get_speed (job);
 			const char *state = nemo_rclone_job_get_state_label (job);
+			NemoRcloneJobState jstate = nemo_rclone_job_get_state (job);
 			char *desc = NULL;
 			char *progress = NULL;
 			char *spd = NULL;
@@ -206,13 +415,16 @@ jobs_refresh (RcloneWindow *self,
 			gtk_list_store_append (store, &iter);
 			gtk_list_store_set (store, &iter,
 			                    0, nemo_rclone_job_get_id (job),
-			                    1, state != NULL ? state : "…",
+			                    1, jobs_state_display (jstate,
+					                      state),
 			                    2, progress,
 			                    3, spd != NULL ? spd : "",
 			                    4, desc,
 			                    5, TRUE,
 			                    6, job,
 			                    7, NULL,
+			                    8, jobs_state_color (jstate),
+			                    9, jobs_state_glyph (jstate),
 			                    -1);
 			g_free (desc);
 			g_free (progress);
@@ -254,13 +466,20 @@ jobs_refresh (RcloneWindow *self,
 		gtk_list_store_append (store, &iter);
 		gtk_list_store_set (store, &iter,
 		                    0, g_strdup_printf ("n:%u", nemo_counter++),
-		                    1, state != NULL ? state : _("running"),
+		                    1, jobs_state_display (progress >= 1.0 ?
+					                      NEMO_RCLONE_JOB_DONE :
+					                      NEMO_RCLONE_JOB_RUNNING,
+					                      state),
 		                    2, progress_txt,
 		                    3, spd != NULL ? spd : "",
 		                    4, desc,
 		                    5, FALSE,
 		                    6, NULL,
 		                    7, info,
+		                    8, jobs_nemo_state_color (progress, TRUE),
+		                    9, jobs_state_glyph (progress >= 1.0 ?
+		                                         NEMO_RCLONE_JOB_DONE :
+		                                         NEMO_RCLONE_JOB_RUNNING),
 		                    -1);
 		g_free (state);
 		g_free (desc);
@@ -315,6 +534,8 @@ jobs_update_live (RcloneWindow *self)
 		gpointer job, info;
 		char *progress = NULL;
 		char *spd = NULL;
+		char *color = NULL;
+		char *glyph = NULL;
 
 		gtk_tree_model_get (model, &iter, 5, &kind, 6, &job, 7, &info, -1);
 
@@ -322,6 +543,7 @@ jobs_update_live (RcloneWindow *self)
 			NemoRcloneJob *rjob = NEMO_RCLONE_JOB (job);
 			double frac = nemo_rclone_job_get_fraction (rjob);
 			double speed = nemo_rclone_job_get_speed (rjob);
+			NemoRcloneJobState jstate = nemo_rclone_job_get_state (rjob);
 
 			if (frac >= 0.0) {
 				progress = g_strdup_printf ("%ld%%", (long) (frac * 100.0 + 0.5));
@@ -331,20 +553,47 @@ jobs_update_live (RcloneWindow *self)
 			if (speed > 0) {
 				spd = g_strdup_printf ("%s/s", g_format_size ((guint64) speed));
 			}
-			gtk_list_store_set (self->jobs_store, &iter, 2, progress, 3, spd, -1);
+			color = g_strdup (jobs_state_color (jstate));
+			glyph = g_strdup (jobs_state_glyph (jstate));
+			{
+				char *state_disp = jobs_state_display (jstate,
+				                    nemo_rclone_job_get_state_label (rjob));
+				gtk_list_store_set (self->jobs_store, &iter,
+				                    1, state_disp,
+				                    2, progress, 3, spd, 8, color, 9, glyph,
+				                    -1);
+				g_free (state_disp);
+			}
 		} else if (kind == JOB_KIND_NEMO && info != NULL) {
 			double p = nemo_progress_info_get_progress (NEMO_PROGRESS_INFO (info));
 
 			if (p >= 1.0) {
 				progress = g_strdup (_("Done"));
+				color = g_strdup (jobs_nemo_state_color (p, TRUE));
+				glyph = g_strdup (jobs_state_glyph (NEMO_RCLONE_JOB_DONE));
 			} else {
 				progress = g_strdup_printf ("%ld%%", (long) (p * 100.0 + 0.5));
+				color = g_strdup (jobs_nemo_state_color (p, TRUE));
+				glyph = g_strdup (jobs_state_glyph (NEMO_RCLONE_JOB_RUNNING));
 			}
-			gtk_list_store_set (self->jobs_store, &iter, 2, progress, -1);
+			{
+				char *status = nemo_progress_info_get_status (
+				                    NEMO_PROGRESS_INFO (info));
+				char *state_disp = jobs_state_display (
+				                    p >= 1.0 ? NEMO_RCLONE_JOB_DONE :
+				                             NEMO_RCLONE_JOB_RUNNING, status);
+				gtk_list_store_set (self->jobs_store, &iter,
+				                    1, state_disp,
+				                    2, progress, 8, color, 9, glyph, -1);
+				g_free (status);
+				g_free (state_disp);
+			}
 		}
 
 		g_free (progress);
 		g_free (spd);
+		g_free (color);
+		g_free (glyph);
 	}
 }
 
@@ -352,10 +601,32 @@ static gboolean
 jobs_live_tick (gpointer user_data)
 {
 	RcloneWindow *self = user_data;
+	guint interval_ms;
 
 	jobs_update_live (self);
 
-	return G_SOURCE_CONTINUE;
+	/* Honor the "auto-clear finished jobs" setting: once every job is
+	   finished, remove them from the list so the page stays tidy. */
+	if (self->jobs_auto_clear) {
+		NemoRcloneJobManager *manager = self->job_manager;
+
+		if (manager != NULL &&
+		    nemo_rclone_job_manager_count_finished (manager) > 0 &&
+			nemo_rclone_job_manager_count_running (manager) == 0) {
+			nemo_rclone_job_manager_clear_finished (manager);
+			jobs_refresh (self, NULL);
+		}
+	}
+
+	/* Re-schedule using the current (possibly user-changed) rate so the
+	   refresh interval always reflects the latest setting.  The rate is
+	   clamped to 1..4 Hz, i.e. an interval of 250..1000 ms, which keeps
+	   updates smooth (<= 4 Hz) and free of flicker. */
+	interval_ms = self->jobs_tick_rate >= 1 ?
+	              1000 / self->jobs_tick_rate : 1000;
+	self->jobs_timer = g_timeout_add (interval_ms, jobs_live_tick, self);
+
+	return G_SOURCE_REMOVE;
 }
 
 static void
@@ -1806,6 +2077,198 @@ favorites_status_tick (gpointer user_data)
 	return G_SOURCE_CONTINUE;
 }
 
+typedef struct {
+	GtkWidget *rate_spin;
+	GtkWidget *auto_clear_check;
+	GtkWidget *check_state;
+	GtkWidget *check_progress;
+	GtkWidget *check_speed;
+	GtkWidget *check_job;
+} JobsSettingsData;
+
+/* Apply the column-visibility settings to the Jobs tree view. */
+static void jobs_apply_column_visibility (RcloneWindow *self);
+
+/* Called when the Jobs settings dialog is dismissed.  Reads the chosen
+   values (only when OK was pressed), persists them, and restarts the
+   live-update timer so the new refresh rate takes effect immediately. */
+static void
+jobs_settings_response_cb (GtkDialog *dialog,
+                           GtkResponseType response_id,
+                           gpointer user_data)
+{
+	RcloneWindow *self = user_data;
+	JobsSettingsData *data;
+	guint interval_ms;
+
+	(void) dialog;
+
+	if (response_id != GTK_RESPONSE_OK)
+		return;
+
+	data = g_object_get_data (G_OBJECT (dialog), "rclone-jobs-settings");
+	if (data != NULL) {
+		gint rate = gtk_spin_button_get_value_as_int (
+			GTK_SPIN_BUTTON (data->rate_spin));
+		self->jobs_tick_rate = (rate >= 1 && rate <= 4) ? rate : 1;
+		self->jobs_auto_clear =
+			gtk_toggle_button_get_active (
+				GTK_TOGGLE_BUTTON (data->auto_clear_check));
+		self->jobs_show_state =
+			gtk_toggle_button_get_active (
+				GTK_TOGGLE_BUTTON (data->check_state));
+		self->jobs_show_progress =
+			gtk_toggle_button_get_active (
+				GTK_TOGGLE_BUTTON (data->check_progress));
+		self->jobs_show_speed =
+			gtk_toggle_button_get_active (
+				GTK_TOGGLE_BUTTON (data->check_speed));
+		self->jobs_show_job =
+			gtk_toggle_button_get_active (
+				GTK_TOGGLE_BUTTON (data->check_job));
+	}
+
+	jobs_apply_column_visibility (self);
+
+	jobs_settings_save (self);
+
+	/* Restart the live-update timer at the new rate. */
+	if (self->jobs_timer != 0) {
+		g_source_remove (self->jobs_timer);
+		self->jobs_timer = 0;
+	}
+	jobs_update_live (self);
+	interval_ms = self->jobs_tick_rate >= 1 ?
+	              1000 / self->jobs_tick_rate : 1000;
+	self->jobs_timer = g_timeout_add (interval_ms, jobs_live_tick, self);
+}
+
+/* Build and return the Jobs settings modal dialog.  The dialog is owned
+   by the caller, who is responsible for destroying it. */
+static GtkWidget *
+build_jobs_settings_dialog (RcloneWindow *self)
+{
+	GtkWidget *dialog;
+	GtkWidget *content;
+	GtkWidget *grid;
+	GtkWidget *rate_label;
+	JobsSettingsData *data;
+
+	dialog = gtk_dialog_new_with_buttons (_("Jobs Settings"),
+	                                      GTK_WINDOW (self->window),
+	                                      GTK_DIALOG_MODAL,
+	                                      "_Cancel", GTK_RESPONSE_CANCEL,
+	                                      "_OK", GTK_RESPONSE_OK,
+	                                      NULL);
+
+	content = gtk_dialog_get_content_area (GTK_DIALOG (dialog));
+
+	grid = gtk_grid_new ();
+	gtk_container_set_border_width (GTK_CONTAINER (grid), 12);
+	gtk_grid_set_row_spacing (GTK_GRID (grid), 10);
+	gtk_grid_set_column_spacing (GTK_GRID (grid), 8);
+	gtk_box_pack_start (GTK_BOX (content), grid, FALSE, FALSE, 0);
+
+	rate_label = gtk_label_new (_("Refresh rate (Hz):"));
+	gtk_label_set_xalign (GTK_LABEL (rate_label), 1.0);
+	gtk_grid_attach (GTK_GRID (grid), rate_label, 0, 0, 1, 1);
+
+	data = g_new0 (JobsSettingsData, 1);
+	data->rate_spin = gtk_spin_button_new_with_range (1, 4, 1);
+	gtk_spin_button_set_digits (GTK_SPIN_BUTTON (data->rate_spin), 0);
+	gtk_spin_button_set_value (GTK_SPIN_BUTTON (data->rate_spin),
+	                           self->jobs_tick_rate);
+	gtk_grid_attach (GTK_GRID (grid), data->rate_spin, 1, 0, 1, 1);
+
+	data->auto_clear_check = gtk_check_button_new_with_label (
+		_("Remove completed jobs from the list automatically"));
+	gtk_toggle_button_set_active (GTK_TOGGLE_BUTTON (data->auto_clear_check),
+	                              self->jobs_auto_clear);
+	gtk_grid_attach (GTK_GRID (grid), data->auto_clear_check, 0, 1, 2, 1);
+
+	/* Column-visibility toggles: let the user show/hide each Jobs column. */
+	data->check_state = gtk_check_button_new_with_label (_("Show state"));
+	gtk_toggle_button_set_active (GTK_TOGGLE_BUTTON (data->check_state),
+	                              self->jobs_show_state);
+	gtk_grid_attach (GTK_GRID (grid), data->check_state, 0, 2, 2, 1);
+
+	data->check_progress = gtk_check_button_new_with_label (_("Show progress"));
+	gtk_toggle_button_set_active (GTK_TOGGLE_BUTTON (data->check_progress),
+	                              self->jobs_show_progress);
+	gtk_grid_attach (GTK_GRID (grid), data->check_progress, 0, 3, 2, 1);
+
+	data->check_speed = gtk_check_button_new_with_label (_("Show speed"));
+	gtk_toggle_button_set_active (GTK_TOGGLE_BUTTON (data->check_speed),
+	                              self->jobs_show_speed);
+	gtk_grid_attach (GTK_GRID (grid), data->check_speed, 0, 4, 2, 1);
+
+	data->check_job = gtk_check_button_new_with_label (_("Show job"));
+	gtk_toggle_button_set_active (GTK_TOGGLE_BUTTON (data->check_job),
+	                              self->jobs_show_job);
+	gtk_grid_attach (GTK_GRID (grid), data->check_job, 0, 5, 2, 1);
+
+	g_object_set_data (G_OBJECT (dialog),
+	                   "rclone-jobs-settings", data);
+
+	gtk_widget_show_all (dialog);
+
+	return dialog;
+}
+
+static void
+on_jobs_settings_clicked (GtkButton *button,
+                          gpointer user_data)
+{
+	RcloneWindow *self = user_data;
+	GtkWidget *dialog;
+	GtkResponseType result;
+
+	(void) button;
+
+	dialog = build_jobs_settings_dialog (self);
+	result = gtk_dialog_run (GTK_DIALOG (dialog));
+	jobs_settings_response_cb (GTK_DIALOG (dialog), result, self);
+	gtk_widget_destroy (dialog);
+}
+
+/* Apply the column-visibility settings to the Jobs tree view.  Columns are
+   matched by their header text so this works even outside build_jobs_tab
+   (e.g. after the user toggles a checkbox in the settings dialog). */
+static void
+jobs_apply_column_visibility (RcloneWindow *self)
+{
+	GList *cols, *l;
+
+	if (self->jobs_view == NULL)
+		return;
+
+	cols = gtk_tree_view_get_columns (GTK_TREE_VIEW (self->jobs_view));
+	for (l = cols; l != NULL; l = l->next) {
+		GtkTreeViewColumn *col = GTK_TREE_VIEW_COLUMN (l->data);
+		char *title = NULL;
+
+		g_object_get (col, "title", &title, NULL);
+
+		if (title != NULL) {
+			if (g_strcmp0 (title, _("State")) == 0) {
+				gtk_tree_view_column_set_visible (col,
+				                          self->jobs_show_state);
+			} else if (g_strcmp0 (title, _("Progress")) == 0) {
+				gtk_tree_view_column_set_visible (col,
+				                          self->jobs_show_progress);
+			} else if (g_strcmp0 (title, _("Speed")) == 0) {
+				gtk_tree_view_column_set_visible (col,
+				                          self->jobs_show_speed);
+			} else if (g_strcmp0 (title, _("Job")) == 0) {
+				gtk_tree_view_column_set_visible (col,
+				                          self->jobs_show_job);
+			}
+		}
+		g_free (title);
+	}
+	g_list_free (cols);
+}
+
 static GtkWidget *
 build_jobs_tab (RcloneWindow *self)
 {
@@ -1814,12 +2277,17 @@ build_jobs_tab (RcloneWindow *self)
 	GtkWidget *buttons;
 	GtkWidget *cancel_button;
 	GtkWidget *clear_button;
+	GtkWidget *settings_button;
 	GtkWidget *detail_scroll;
 	GtkCellRenderer *renderer;
 	GtkTreeViewColumn *column;
 
 	self->job_manager = nemo_rclone_job_manager_get_default ();
-	self->jobs_store = gtk_list_store_new (8,
+
+	/* Apply persisted Jobs-page settings (tick rate, column visibility). */
+	jobs_settings_load (self);
+
+	self->jobs_store = gtk_list_store_new (10,
 	                                       G_TYPE_STRING,
 	                                       G_TYPE_STRING,
 	                                       G_TYPE_STRING,
@@ -1827,17 +2295,21 @@ build_jobs_tab (RcloneWindow *self)
 	                                       G_TYPE_STRING,
 	                                       G_TYPE_BOOLEAN,
 	                                       G_TYPE_POINTER,
-	                                       G_TYPE_POINTER);
+	                                       G_TYPE_POINTER,
+	                                       G_TYPE_STRING,
+	                                       G_TYPE_STRING);
 
 	self->jobs_view = gtk_tree_view_new_with_model (
 		GTK_TREE_MODEL (self->jobs_store));
 	gtk_tree_view_set_headers_visible (GTK_TREE_VIEW (self->jobs_view), TRUE);
 	gtk_tree_view_set_enable_search (GTK_TREE_VIEW (self->jobs_view), FALSE);
 
-	/* State */
+	/* State (colored by state; column 8 carries the CSS color name) */
 	renderer = gtk_cell_renderer_text_new ();
 	column = gtk_tree_view_column_new_with_attributes (_("State"), renderer,
 	                                                   "text", 1, NULL);
+	gtk_tree_view_column_set_attributes (column, renderer,
+	                                     "foreground", 8, NULL);
 	gtk_tree_view_append_column (GTK_TREE_VIEW (self->jobs_view), column);
 
 	/* Progress as a percentage */
@@ -1858,6 +2330,10 @@ build_jobs_tab (RcloneWindow *self)
 	                                                   "text", 4, NULL);
 	gtk_tree_view_column_set_expand (column, TRUE);
 	gtk_tree_view_append_column (GTK_TREE_VIEW (self->jobs_view), column);
+
+	/* Honor the column-visibility settings: hide the ones the user
+	   disabled, and drop their headers so the column width isn't kept. */
+	jobs_apply_column_visibility (self);
 
 	g_signal_connect (GTK_TREE_VIEW (self->jobs_view), "selection-changed",
 	                  G_CALLBACK (jobs_update_detail), self);
@@ -1938,14 +2414,22 @@ build_jobs_tab (RcloneWindow *self)
 	clear_button = gtk_button_new_with_label (_("Clear finished"));
 	gtk_container_add (GTK_CONTAINER (buttons), clear_button);
 
+	settings_button = gtk_button_new_with_label (_("Settings"));
+	gtk_container_add (GTK_CONTAINER (buttons), settings_button);
+
 	g_signal_connect (cancel_button, "clicked",
 	                  G_CALLBACK (on_jobs_cancel_clicked), self);
 	g_signal_connect (clear_button, "clicked",
 	                  G_CALLBACK (on_jobs_clear_clicked), self);
+	g_signal_connect (settings_button, "clicked",
+	                  G_CALLBACK (on_jobs_settings_clicked), self);
 
 	jobs_refresh (self, NULL);
 
-	self->jobs_timer = g_timeout_add_seconds (1, jobs_live_tick, self);
+	/* Kick off the live-update loop.  jobs_live_tick re-schedules itself
+	   at self->jobs_tick_rate, so the initial 1 s tick is just a
+	   warm-up. */
+	self->jobs_timer = g_timeout_add (1000, jobs_live_tick, self);
 
 	return vbox;
 }

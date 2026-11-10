@@ -42,6 +42,7 @@ void           nemo_rclone_job_manager_remove_job  (NemoRcloneJobManager *self,
 void           nemo_rclone_job_manager_clear_finished (NemoRcloneJobManager *self);
 
 guint          nemo_rclone_job_manager_count_running (NemoRcloneJobManager *self);
+guint          nemo_rclone_job_manager_count_finished (NemoRcloneJobManager *self);
 double         nemo_rclone_job_manager_total_speed   (NemoRcloneJobManager *self);
 
 /* Nemo's own file operations (local / FUSE copies), so the Jobs page can

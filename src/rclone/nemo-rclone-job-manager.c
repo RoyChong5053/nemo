@@ -293,6 +293,25 @@ nemo_rclone_job_manager_count_running (NemoRcloneJobManager *self)
 	return count;
 }
 
+guint
+nemo_rclone_job_manager_count_finished (NemoRcloneJobManager *self)
+{
+	guint count = 0;
+	guint i;
+
+	g_return_val_if_fail (NEMO_IS_RCLONE_JOB_MANAGER (self), 0);
+
+	for (i = 0; i < self->jobs->len; i++) {
+		NemoRcloneJob *job = g_ptr_array_index (self->jobs, i);
+
+		if (nemo_rclone_job_is_finished (job)) {
+			count++;
+		}
+	}
+
+	return count;
+}
+
 double
 nemo_rclone_job_manager_total_speed (NemoRcloneJobManager *self)
 {
