@@ -6867,6 +6867,25 @@ rclone_menu_use_source_cb (GtkMenuItem *item,
 }
 
 static void
+remove_rclone_menu (GtkMenu *menu)
+{
+	GtkWidget *prev;
+
+	/* create_popup_menu() reuses the persistent menu held by the UI
+	   manager, so append_rclone_menu() is called once per right-click on
+	   the same menu.  Remove any Rclone item left over from a previous
+	   pop-up before adding fresh ones, otherwise the menu accumulates one
+	   extra "Rclone" entry per right-click.  This GTK build exposes no
+	   gtk_menu_shell_remove/get_children accessor, so we track the item on
+	   the menu widget and destroy the stored one. */
+	prev = g_object_get_data (G_OBJECT (menu), "nemo-rclone-menu-item");
+	if (prev != NULL) {
+		gtk_widget_destroy (prev);
+		g_object_set_data (G_OBJECT (menu), "nemo-rclone-menu-item", NULL);
+	}
+}
+
+static void
 append_rclone_menu (NemoView *view,
                     GtkMenu *menu,
                     gboolean background)
@@ -6952,6 +6971,11 @@ append_rclone_menu (NemoView *view,
 	gtk_widget_show_all (rclone_item);
 	gtk_menu_shell_append (GTK_MENU_SHELL (menu), rclone_item);
 
+	/* Remember it on the menu so remove_rclone_menu() can tear down the
+	   previous Rclone entry before this one is discarded on the next
+	   pop-up. */
+	g_object_set_data (G_OBJECT (menu), "nemo-rclone-menu-item", rclone_item);
+
 	g_free (local_path);
 	g_free (remote);
 	g_free (remote_path);
@@ -6969,6 +6993,9 @@ create_popup_menu (NemoView *view, const char *popup_path)
 
 	if (g_strcmp0 (popup_path, NEMO_VIEW_POPUP_PATH_SELECTION) == 0 ||
 	    g_strcmp0 (popup_path, NEMO_VIEW_POPUP_PATH_BACKGROUND) == 0) {
+		/* Drop any Rclone entries left from a previous pop-up before
+		   rebuilding, or they'd accumulate one per right-click. */
+		remove_rclone_menu (GTK_MENU (menu));
 		append_rclone_menu (view, GTK_MENU (menu),
 		                    g_strcmp0 (popup_path, NEMO_VIEW_POPUP_PATH_BACKGROUND) == 0);
 	}
