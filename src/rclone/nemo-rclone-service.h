@@ -41,6 +41,15 @@ typedef struct {
 G_DECLARE_FINAL_TYPE (NemoRcloneService, nemo_rclone_service,
                       NEMO, RCLONE_SERVICE, GObject)
 
+/* Build the "rclone mount ..." argv for a favorite at a given mountpoint.
+   Used by nemo_rclone_service_mount_favorite(); also exposed so tests can
+   assert the argv only contains flags rclone actually understands (guards
+   against re-adding an unknown flag such as the old --vfs-flags). */
+void build_mount_argv (NemoRcloneService *self,
+                       NemoRcloneFavorite *favorite,
+                       const char *mountpoint,
+                       char ***argv_out);
+
 NemoRcloneService *nemo_rclone_service_get_default (void);
 
 gboolean            nemo_rclone_service_is_available      (NemoRcloneService *self);

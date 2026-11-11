@@ -1556,10 +1556,10 @@ nemo_rclone_service_free_mount_opts (RcloneMountOpts *opts)
 	mount_opts_free (opts);
 }
 
-/* Build argv for "rclone mount <spec> <mountpoint> --vfs-flags".  The returned
+/* Build argv for "rclone mount <spec> <mountpoint> <vfs-flags...>".  The returned
    argv is NULL-terminated and owned by the caller.  spec is taken into argv,
    so this frees it (no caller return needed). */
-static void
+void
 build_mount_argv (NemoRcloneService *self,
                   NemoRcloneFavorite *favorite,
                   const char *mountpoint,
@@ -1612,11 +1612,6 @@ build_mount_argv (NemoRcloneService *self,
 	argv[n++] = g_strdup (opts->attr_timeout);
 	argv[n++] = g_strdup ("--poll-interval");
 	argv[n++] = g_strdup (opts->poll_interval);
-	/* omit-mountpoint-in-errors keeps FUSE error paths from leaking the
-	   local mountpoint (an Android path) into rclone's messages. */
-	argv[n++] = g_strdup ("--vfs-flags");
-	argv[n++] = g_strdup ("omit-mountpoint-in-errors");
-
 	cache_dir = g_build_filename (g_get_user_cache_dir (),
 	                              "rclone", "vfs", NULL);
 	argv[n++] = g_strdup ("--cache-dir");

@@ -270,6 +270,22 @@ Nemo 视图 ── FUSE mount ── rclone VFS ── remote
    - **待办**：`--vfs-write-back`、`--timeout`、`--sftp-concurrency` 等按 profile 区分
      （P3），以及把“mount profile”做成独立下拉（balanced / browse-fast /
      upload-heavy / low-power-SFTP）。
+- **P1.6 无效 flag `--vfs-flags` 导致 mount 恒失败 — ✅ 已完成（2026-11-12）**
+   - **症状**：点击 sidebar 里除 lgv35 外的任何 remote 都报怪错；唯独 lgv35 显示"成功"。
+   - **根因**：`build_mount_argv()` 往 `rclone mount` 里塞了本版本 rclone(v1.75.1) 不认识的
+     `--vfs-flags`（+`--omit-mountpoint-in-errors`）→ rclone 一启动就 `unknown flag` 退出。
+     lgv35 之所以"成功"是因为它已被挂着，点击时 `remote_to_local()` 命中已挂载直接
+     `open_local_path()` 短接、根本没重新 mount；其它都还没挂，每次都撞到坏 flag。
+   - **修复**：`nemo-rclone-service.c` 删掉那两行（及错误注释），`build_mount_argv` 由
+     `static` 改为非 static 并在 `nemo-rclone-service.h` 声明（便于测试直接断言 argv）。
+   - **防回归**：新增 `test/rclone-mount-argv-test.c`，`meson test 'Rclone mount argv (no bogus flags)'`
+     可跑。断言：① argv 不含 `--vfs-flags` / `omit-mountpoint-in-errors`；② 每个 `--flag`
+     都真实出现在 `rclone mount --help` + `rclone help flags` 输出里（用
+     `g_spawn_command_line_sync` 5 参数版抓 stdout+stderr 合并后子串比对，兼容本仓库精简 glib
+     缺 `G_SPAWN_STDOUT_PIPE` 等管道 flag 的情况）。
+   - **实机验证**：用修复后真实参数起 `rclone mount`，m64 成功挂载（37 条目）；gt20 现在正确报告
+     真实网络错误 `connection refused`（其 SSH 主机 192.168.100.242:8022 此刻不可达），
+     而不再是假 flag 错误 —— 即"挂不上"已纯粹是网络/主机问题，不再是 mount bug。
 - **P2 RC 统计 / FUSE 上传可见**
   - mount argv 加 `--rc` socket；JobManager 轮询 `vfs/queue`、`vfs/stats`。
   - copy 进挂载点后，Nemo 进度到 100% 时 Jobs 页继续显示 “Uploading to <remote>” 直到 queue 清空。
@@ -293,4 +309,38 @@ Nemo 视图 ── FUSE mount ── rclone VFS ── remote
 - 复制 1GB 到挂载点：Nemo 到 100% 后 Jobs 页仍显示 upload queue，queue 归零后任务完成。
 - 断网/iptables DROP 后打开远程目录，30s 内出现错误/重试，不无限转圈。
 - 关掉 Nemo 再打开，Jobs 页能重连仍在运行的 job/mount socket（至少显示活动任务）。
+
+---
+
+## 7. 可观测性：rclone 统一日志系统
+
+> 解决"调试只能靠散落的 `DIAG` printfs 猜"——这是让 mount/RC/job 各类 bug 能被快速定位的地基。
+
+### 7.1 痛点
+- 当前调试全靠 `nemo-rclone-rc.c` 等文件里手写的 `g_printerr("DIAG …")`：
+  分散、无级别、**不落盘**；`super+e` 启动后 stderr 进 `/dev/null`，GUI 里复现的报错几乎无法定位
+  （参见 P1.6 那次：靠手动 grep 日志才定位到 `--vfs-flags`）。
+
+### 7.2 设计
+- 新 `src/rclone/nemo-rclone-log.[ch]`：`rclone_log(level, fmt, …)` 一族
+  （`RCLONE_DEBUG / INFO / WARNING / ERROR`），写
+  `~/.cache/nemo-rclone/nemo-rclone.log`（按大小滚动，ERROR 同时进 stderr）。
+- 全局开关：`NEMO_RCLONE_LOG=debug|info|warning|error` 控制级别（默认 `info`）；
+  不设该 env 时用默认级别，不污染正常输出。
+- 关键路径打点：
+  - mount 失败（`mount_favorite` 的 error + rclone 日志尾部）—— 直接支撑 P1.6 类问题；
+  - RC 轮询（`nemo_rclone_rc_call` 的 write / status line / 解析各步，见 P1 RC 轮询）；
+  - job 引擎状态变迁（queued → running → done/failed）；
+  - 侧边栏点击 → mount 链路（命中/未命中 favorite、`remote_to_local` 短接等）。
+- 用 GLib `g_log` 风格或自写轻量实现（不引额外依赖）；原 `DIAG printfs` 逐步替换为
+  `rclone_log(RCLONE_DEBUG, …)`。
+
+### 7.3 验证
+- `meson test` 加日志级别解析单测（`NEMO_RCLONE_LOG` → 阈值过滤）。
+- 真机点一个连不上的 remote，确认 log 文件出现并含 `connection refused` 与触发点，
+  无需再靠 stderr 瞎猜。
+
+### 7.4 优先级
+- 支撑 P1.6 及后续所有 rclone bug 的快速定位，属"地基"型投入，建议早做（可在 Rclone
+  Manager 之前或并行）。
 

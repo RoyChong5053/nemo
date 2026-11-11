@@ -55,11 +55,34 @@ test('Rclone mount options',
   args: []
 )
 
+test('Rclone mount argv (no bogus flags)',
+  executable('test-rclone-mount-argv',
+    [ 'rclone-mount-argv-test.c', '../src/rclone/nemo-rclone-service.c',
+      '../src/rclone/nemo-rclone-path.c' ],
+    include_directories: [ rootInclude, include_directories('../src/rclone') ],
+    dependencies: [ glib, json, gtk ],
+  ),
+  args: []
+)
+
 test('Rclone job concurrency',
   executable('test-rclone-job-concurrency',
     [ 'rclone-job-concurrency-test.c',
       '../src/rclone/nemo-rclone-job.c',
-      '../src/rclone/nemo-rclone-job-manager.c' ],
+      '../src/rclone/nemo-rclone-job-manager.c',
+      '../src/rclone/nemo-rclone-rc.c' ],
+    include_directories: [ rootInclude, include_directories('../src/rclone') ],
+    dependencies: [ glib, json, nemo_private ],
+  ),
+  args: []
+)
+
+test('Rclone RC polling (real remote progress)',
+  executable('test-rclone-rc-polling',
+    [ 'rclone-rc-polling-test.c',
+      '../src/rclone/nemo-rclone-job.c',
+      '../src/rclone/nemo-rclone-job-manager.c',
+      '../src/rclone/nemo-rclone-rc.c' ],
     include_directories: [ rootInclude, include_directories('../src/rclone') ],
     dependencies: [ glib, json, nemo_private ],
   ),
